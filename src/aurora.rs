@@ -69,6 +69,7 @@ uniform float u_ppp;
 uniform float u_opacity;
 uniform vec4 u_rect[4];
 uniform vec4 u_tint[4];
+uniform vec4 u_col[4];
 V_IN vec2 v_uv;
 
 vec3 hue(vec3 c, float cs, float sn) {
@@ -87,6 +88,12 @@ vec4 prints(vec2 q) {
         if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) continue;
         vec4 c = TEX(u_lamp, uv);
         c.rgb = hue(c.rgb, u_tint[i].x, u_tint[i].y);
+        // teinte de la pochette : la colonne prend la couleur cible à luminosité égale,
+        // les zones chaudes quasi blanches restent blanches (saturation d'origine faible)
+        float mx = max(max(c.r, c.g), c.b);
+        float s0 = mx > 1e-4 ? (mx - min(min(c.r, c.g), c.b)) / mx : 0.0;
+        vec3 cov = mix(vec3(mx), mx * u_col[i].rgb, s0);
+        c.rgb = mix(c.rgb, cov, u_tint[i].w);
         c *= u_tint[i].z;
         acc = c + acc * (1.0 - c.a);
     }
@@ -161,14 +168,29 @@ unsafe impl Sync for Aurora {}
 #[derive(Clone, Copy)]
 pub struct Params {
     pub phase: f32,
-    pub full_height: bool,
+    /// 0 = bandeau en haut de fenêtre, 1 = pleine hauteur (connexion, Now Playing) ; animable
+    pub tall: f32,
     pub opacity: f32,
-    /// rotation de teinte globale (degrés) appliquée à tous les rideaux
-    pub shift: f32,
+    /// couleur cible de chaque rideau (0 gauche, 1 colonne principale, 2 droite, 3 haut)
+    pub cols: [[f32; 3]; 4],
+    /// part de la couleur de pochette (0 = aurora violette d'origine, 1 = pochette)
+    pub follow: f32,
 }
 
-/// Teinte dominante de la lampe d'origine (violet) : décalage nul pour la palette par défaut.
-pub const BASE_HUE: f32 = 266.0;
+impl Params {
+    /// Répartit la palette de la pochette sur les rideaux : couleur dominante au centre,
+    /// secondaire sur les côtés, troisième en haut. Couleurs normalisées (canal max = 1).
+    pub fn colours(p: &[egui::Color32; 3]) -> [[f32; 3]; 4] {
+        let n = |c: egui::Color32| {
+            let v = [c.r() as f32, c.g() as f32, c.b() as f32];
+            let m = v[0].max(v[1]).max(v[2]).max(1.0);
+            [v[0] / m, v[1] / m, v[2] / m]
+        };
+        let mid = |a: [f32; 3], b: [f32; 3]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+        let (a, b, c) = (n(p[0]), n(p[1]), n(p[2]));
+        [b, a, mid(a, b), c]
+    }
+}
 
 impl Aurora {
     pub fn new(gl: &glow::Context) -> Option<Self> {
@@ -245,7 +267,7 @@ impl Aurora {
                 glow::PixelUnpackData::Slice(Some(&px)),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let names = ["u_lamp", "u_size", "u_phase", "u_ppp", "u_opacity", "u_rect", "u_tint", ""];
+            let names = ["u_lamp", "u_size", "u_phase", "u_ppp", "u_opacity", "u_rect", "u_tint", "u_col"];
             let loc = names.map(|n| if n.is_empty() { None } else { gl.get_uniform_location(prog, n) });
             Some(Self { prog, vao, vbo, tex, loc })
         }
@@ -255,17 +277,20 @@ impl Aurora {
         let size = info.viewport.size();
         let (w, h) = (size.x, size.y);
         // géométrie des rideaux (cf. StudioAurora.prints)
-        let height = if prm.full_height { h * 0.79 } else { (h * 0.48).min(w * 0.42) };
+        let lerp = |a: f32, b: f32| a + (b - a) * prm.tall;
+        let height = lerp((h * 0.48).min(w * 0.42), h * 0.79);
         let mut rects = [0f32; 16];
         let mut tints = [0f32; 16];
+        let mut cols = [0f32; 16];
         for (i, &(x, scale, hue, strength, y)) in CURTAINS.iter().enumerate() {
-            let width = (w * if prm.full_height { 0.66 } else { 0.68 }).min(height * 2.1) * scale;
+            let width = (w * lerp(0.68, 0.66)).min(height * 2.1) * scale;
             let depth = height * scale;
             let s = (i as f32).sin();
-            let cy = depth * (if prm.full_height { y } else { 0.31 } + 0.035 * s);
+            let cy = depth * (lerp(0.31, y) + 0.035 * s);
             rects[i * 4..i * 4 + 4].copy_from_slice(&[w * (x + 0.026 * s), cy, width, depth]);
-            let r = (hue + prm.shift).to_radians();
-            tints[i * 4..i * 4 + 4].copy_from_slice(&[r.cos(), r.sin(), strength, 0.0]);
+            let r = hue.to_radians();
+            tints[i * 4..i * 4 + 4].copy_from_slice(&[r.cos(), r.sin(), strength, prm.follow]);
+            cols[i * 4..i * 4 + 3].copy_from_slice(&prm.cols[i]);
         }
         unsafe {
             gl.use_program(Some(self.prog));
@@ -278,6 +303,7 @@ impl Aurora {
             gl.uniform_1_f32(self.loc[4].as_ref(), prm.opacity);
             gl.uniform_4_f32_slice(self.loc[5].as_ref(), &rects);
             gl.uniform_4_f32_slice(self.loc[6].as_ref(), &tints);
+            gl.uniform_4_f32_slice(self.loc[7].as_ref(), &cols);
             match self.vao {
                 Some(v) => gl.bind_vertex_array(Some(v)),
                 None => {

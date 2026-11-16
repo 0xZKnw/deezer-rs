@@ -34,6 +34,10 @@ pub enum Ic {
     Link,
     Close,
     Sidebar,
+    /// paroles : bulle avec deux lignes de texte
+    Lyrics,
+    /// chevron vers le bas (fermer la vue plein écran)
+    Down,
 }
 
 fn poly(p: &Painter, pts: &[(f32, f32)], c: Pos2, u: f32, col: Color32) {
@@ -242,6 +246,15 @@ pub fn draw(p: &Painter, ic: Ic, c: Pos2, size: f32, col: Color32) {
         Ic::Close => {
             line(p, &[(-0.6, -0.6), (0.6, 0.6)], c, u, st);
             line(p, &[(-0.6, 0.6), (0.6, -0.6)], c, u, st);
+        }
+        Ic::Lyrics => {
+            p.rect_stroke(Rect::from_center_size(pos2(c.x, c.y - 0.12 * u), vec2(1.75 * u, 1.35 * u)), CornerRadius::same((0.35 * u) as u8), st, egui::StrokeKind::Middle);
+            line(p, &[(-0.45, -0.32), (0.45, -0.32)], c, u, st);
+            line(p, &[(-0.45, 0.08), (0.15, 0.08)], c, u, st);
+            line(p, &[(-0.38, 0.55), (-0.52, 0.92), (-0.05, 0.55)], c, u, st);
+        }
+        Ic::Down => {
+            line(p, &[(-0.7, -0.3), (0.0, 0.4), (0.7, -0.3)], c, u, st);
         }
         Ic::Sidebar => {
             p.rect_stroke(Rect::from_center_size(c, vec2(1.7 * u, 1.5 * u)), CornerRadius::same(3), st, egui::StrokeKind::Middle);

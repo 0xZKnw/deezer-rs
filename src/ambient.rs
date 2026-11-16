@@ -9,6 +9,9 @@ pub type Pal = [Color32; 3];
 // ------------------------------------------------------------------ palette
 
 /// Palette par défaut (aucune pochette) : violet Deezer, rose, indigo.
+/// Pochette noir et blanc.
+pub const MONO: Pal = [Color32::from_rgb(226, 226, 232), Color32::from_rgb(196, 198, 210), Color32::from_rgb(170, 172, 186)];
+
 pub const DEFAULT: Pal = [Color32::from_rgb(150, 60, 255), Color32::from_rgb(255, 70, 150), Color32::from_rgb(70, 60, 200)];
 
 fn hsv(c: [f32; 3]) -> (f32, f32, f32) {
@@ -70,9 +73,9 @@ pub fn extract(img: &egui::ColorImage) -> Pal {
     let mut order: Vec<usize> = (0..12).collect();
     order.sort_by(|a, b| bins[*b].0.total_cmp(&bins[*a].0));
     let b1 = order[0];
-    // pochette quasi monochrome => palette par défaut teintée
+    // pochette noir et blanc / quasi monochrome => aurora argentée
     if bins[b1].0 < total * 0.012 {
-        return DEFAULT;
+        return MONO;
     }
     let col = |i: usize| {
         let b = bins[i];
@@ -84,18 +87,16 @@ pub fn extract(img: &egui::ColorImage) -> Pal {
         let d = (i as i32 - b1 as i32).rem_euclid(12).min((b1 as i32 - i as i32).rem_euclid(12));
         d >= 2 && bins[i].0 > bins[b1].0 * 0.12
     });
-    let c1 = norm((h1, s1, v1), 0.55, 0.9, 0.75, 0.95);
+    // pochette terne => aurora douce ; pochette vive => aurora saturée (plancher bas exprès)
+    let colourful = (bins[b1].0 / total.max(1.0) * 6.0).clamp(0.0, 1.0);
+    let smin = 0.22 + 0.33 * colourful;
+    let c1 = norm((h1, s1, v1), smin, 0.92, 0.75, 0.95);
     let c2 = match second {
-        Some(i) => norm(col(i), 0.5, 0.9, 0.7, 0.95),
-        None => from_hsv(h1 + 0.08, s1.clamp(0.5, 0.85), v1.clamp(0.7, 0.92)),
+        Some(i) => norm(col(i), smin * 0.9, 0.9, 0.7, 0.95),
+        None => from_hsv(h1 + 0.07, s1.clamp(smin * 0.9, 0.85), v1.clamp(0.7, 0.92)),
     };
-    let c3 = from_hsv(h1 - 0.06, s1.clamp(0.45, 0.8), v1.clamp(0.45, 0.6));
+    let c3 = from_hsv(h1 - 0.05, s1.clamp(smin * 0.8, 0.8), v1.clamp(0.55, 0.7));
     [c1, c2, c3]
-}
-
-/// Teinte (degrés) d'une couleur.
-pub fn hue_deg(c: Color32) -> f32 {
-    hsv([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]).0 * 360.0
 }
 
 pub fn lerp_pal(a: &Pal, b: &Pal, t: f32) -> Pal {
@@ -105,6 +106,9 @@ pub fn lerp_pal(a: &Pal, b: &Pal, t: f32) -> Pal {
 /// Couleur d'accent lisible (texte blanc dessus) dérivée d'une couleur de palette.
 pub fn accent(c: Color32) -> Color32 {
     let (h, s, v) = hsv([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]);
+    if s < 0.12 {
+        return Color32::from_rgb(222, 222, 230);
+    }
     from_hsv(h, s.clamp(0.5, 0.82), v.clamp(0.78, 0.92))
 }
 

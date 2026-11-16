@@ -48,6 +48,7 @@ pub enum Msg {
     Toast(String),
     Login(Result<String, String>),
     Mutated { msg: String, refresh: bool },
+    Lyrics(u64, crate::lyrics::Lyrics),
 }
 
 #[derive(Clone)]

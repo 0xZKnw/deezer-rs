@@ -10,6 +10,7 @@ mod ambient;
 mod auth;
 mod config;
 mod icons;
+mod lyrics;
 mod model;
 mod pages;
 mod ui;

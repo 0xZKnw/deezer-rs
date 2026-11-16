@@ -102,6 +102,10 @@ pub enum Repeat {
 }
 
 pub enum Act {
+    /// vue « Now Playing » plein écran
+    NowPlaying(bool),
+    /// panneau des paroles (ouvre la vue plein écran si besoin)
+    ToggleLyrics,
     Go(Route),
     Back,
     Forward,
@@ -193,6 +197,10 @@ pub struct App {
     pub web_offer: String,
     pub ws: WebState,
     web_started: bool,
+    /// id réellement joué par le lecteur Deezer (peut différer : version alternative / remplacée)
+    web_song: u64,
+    /// morceau que le lecteur jouait au moment de la demande (à ignorer)
+    web_prev: u64,
     gw_seq: u64,
     gw_pending: HashMap<u64, (String, bool)>,
 
@@ -213,6 +221,13 @@ pub struct App {
     pub upd: crate::update::Updater,
     pub upd_t0: Option<Instant>,
     pub upd_toasted: bool,
+    pub now_playing: bool,
+    pub np_t0: Instant,
+    pub show_lyrics: bool,
+    /// paroles du morceau `.0`
+    pub lyrics: Option<(u64, crate::lyrics::Lyrics)>,
+    /// défilement manuel des paroles (décalage, instant) : suspend le suivi auto quelques secondes
+    pub ly_manual: Option<(f32, Instant)>,
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +305,8 @@ impl App {
             web_offer: String::new(),
             ws: WebState::default(),
             web_started: false,
+            web_song: 0,
+            web_prev: 0,
             gw_seq: 0,
             gw_pending: HashMap::new(),
             search: String::new(),
@@ -311,6 +328,11 @@ impl App {
             upd: crate::update::Updater::new(cc.egui_ctx.clone()),
             upd_t0: None,
             upd_toasted: false,
+            now_playing: false,
+            np_t0: Instant::now(),
+            show_lyrics: false,
+            lyrics: None,
+            ly_manual: None,
         };
         if app.cfg.web {
             // session Deezer mémorisée par WebKit : on relance le lecteur officiel en arrière-plan
@@ -474,6 +496,8 @@ impl App {
             self.want = None;
             self.loading = true;
             self.web_started = false;
+            self.web_prev = if self.ws.song == t.id { 0 } else { self.ws.song };
+            self.web_song = t.id;
             if let Some(a) = self.audio.as_mut() {
                 a.stop();
             }
@@ -617,7 +641,7 @@ impl App {
     /// (position, durée) du morceau courant, quel que soit le moteur.
     pub fn play_pos(&self) -> (Duration, Duration) {
         if self.use_web() {
-            if self.web_started || self.cur.as_ref().map(|t| t.id) == Some(self.ws.song) {
+            if self.ws.song != 0 && self.ws.song == self.web_song {
                 let mut p = self.ws.pos;
                 if self.ws.playing {
                     p += self.ws.at.elapsed().as_secs_f32();
@@ -701,6 +725,7 @@ impl App {
                 Msg::Lib(p) => self.on_lib(p),
                 Msg::Play(t, shuffle) => self.play_list(t, 0, shuffle),
                 Msg::Toast(s) => self.toast(s),
+                Msg::Lyrics(id, l) => self.lyrics = Some((id, l)),
                 Msg::Login(r) => {
                     self.login_busy = false;
                     match r {
@@ -892,6 +917,23 @@ impl App {
                 }
             }
             Act::Shuffle => self.toggle_shuffle(),
+            Act::NowPlaying(on) => {
+                if on && !self.now_playing {
+                    self.np_t0 = Instant::now();
+                }
+                self.now_playing = on && self.cur.is_some();
+                self.ly_manual = None;
+            }
+            Act::ToggleLyrics => {
+                if !self.now_playing {
+                    self.now_playing = self.cur.is_some();
+                    self.np_t0 = Instant::now();
+                    self.show_lyrics = true;
+                } else {
+                    self.show_lyrics = !self.show_lyrics;
+                }
+                self.ly_manual = None;
+            }
             Act::Repeat => {
                 self.repeat = match self.repeat {
                     Repeat::Off => Repeat::All,
@@ -1133,10 +1175,15 @@ impl App {
                         &mut self.ws,
                         WebState { song, playing, pos, dur, loading, at: Instant::now() },
                     );
-                    let Some(cur) = self.cur.as_ref().map(|t| t.id) else { continue };
-                    if !self.use_web() {
+                    if self.cur.is_none() || !self.use_web() {
                         continue;
                     }
+                    // Deezer remplace parfois le titre demandé par une autre version (autre id) :
+                    // le premier morceau lancé après notre demande est le nôtre.
+                    if !self.web_started && song != 0 && song != self.web_song && song != self.web_prev && (playing || loading) {
+                        self.web_song = song;
+                    }
+                    let cur = self.web_song;
                     let mut ended = false;
                     if song == cur {
                         if playing {
@@ -1188,6 +1235,24 @@ impl App {
     pub fn tick(&mut self) {
         self.pump();
         self.pump_web();
+        // paroles : chargées à la demande pour le morceau en cours (vue Now Playing + paroles ouvertes)
+        if self.now_playing && self.show_lyrics {
+            if let Some(id) = self.cur.as_ref().map(|t| t.id) {
+                if self.lyrics.as_ref().map(|l| l.0) != Some(id) {
+                    self.lyrics = Some((id, crate::lyrics::Lyrics::Loading));
+                    self.ly_manual = None;
+                    let (arl, tx, ctx) = (if self.use_web() { self.cfg.arl.clone() } else { String::new() }, self.tx.clone(), self.ctx.clone());
+                    std::thread::spawn(move || {
+                        let l = crate::lyrics::fetch(&arl, id);
+                        let _ = tx.send(Msg::Lyrics(id, l));
+                        ctx.request_repaint();
+                    });
+                }
+            }
+        }
+        if self.cur.is_none() {
+            self.now_playing = false;
+        }
         // mise à jour : vérification discrète quelques secondes après le lancement
         if self.upd_t0.is_some_and(|t| t.elapsed() > Duration::from_secs(4)) {
             self.upd_t0 = None;

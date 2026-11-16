@@ -1,0 +1,32 @@
+[package]
+name = "deezer-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Lecteur Deezer perso, léger (Rust + egui/glow)"
+publish = false
+
+[dependencies]
+# UI : backend glow (OpenGL) = bien plus léger que wgpu. Repaint seulement sur événement.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
+# Audio : décodage MP3 uniquement (les flux Deezer publics sont en MP3)
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3"] }
+# HTTP bloquant minimal, pas de runtime async (pas de tokio => moins de RAM)
+ureq = "3"
+serde_json = "1"
+# Décodage des pochettes (JPEG/PNG seulement)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+lru = "0.19"
+open = "5"
+# WebView système (WKWebView) : connexion Deezer officielle + lecteur du site (morceaux complets)
+wry = { version = "0.55", default-features = false }
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1

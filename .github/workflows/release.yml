@@ -1,0 +1,31 @@
+# Publie une release quand un tag vX.Y.Z est poussé :
+#   (version dans Cargo.toml) puis  git tag v0.2.0 && git push origin v0.2.0
+# L'app la propose ensuite dans Settings → Updates.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$V" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != Cargo.toml $V"; exit 1; }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-${{ hashFiles('Cargo.lock') }}
+      - name: Build universal app
+        run: UNIVERSAL=1 ./bundle.sh
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/Deezer-macos-universal.zip --title "$GITHUB_REF_NAME" --generate-notes

@@ -1,0 +1,13 @@
+# build
+/target
+/dist
+# jamais de données perso / secrets dans le dépôt
+config.json
+*.binarycookies
+.env
+.env.*
+*.pem
+*.p12
+*.key
+*.mobileprovision
+.DS_Store

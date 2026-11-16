@@ -285,6 +285,8 @@ pub struct PageData {
     pub tracks: Vec<Track>,
     pub total: u32,
     pub sections: Vec<Section>,
+    /// > 0 : n'affiche que les N premiers titres (bouton « Show all »), comme Deezer
+    pub preview: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]

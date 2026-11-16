@@ -43,14 +43,19 @@ window.__drs_gw=async(id,method,params)=>{
   if(bad(j.error)){await who();j=await call()}
   send({t:'gw',id,err:bad(j.error)?JSON.stringify(j.error):''});
  }catch(e){send({t:'gw',id,err:String(e)})}};
+const setQ=p=>{const q=window.__drs_q;if(q)try{if(p.control.getAudioQuality()!==q)p.control.setAudioQuality(q)}catch(e){}};
+window.__drs_setq=q=>{window.__drs_q=q;const p=window.dzPlayer;if(p&&p.control)setQ(p)};
 window.__drs_play=(id,n)=>{const p=window.dzPlayer;n=n||0;
  if(!p||!p.play){if(n<60)setTimeout(()=>window.__drs_play(id,n+1),250);else send({t:'noplayer'});return}
+ setQ(p);
  const s=String(id);p.play({type:'track',id:[s],index:0,context:{ID:s,TYPE:'track_page',CONTEXT_ID:s}});};
 window.__drs_c=(f,a)=>{try{const c=window.dzPlayer.control;c[f].apply(c,a||[])}catch(e){}};
 let last='';
 setInterval(()=>{const p=window.dzPlayer;if(!p||!p.getSongId)return;let s;
- try{s={t:'st',song:Number(p.getSongId())||0,playing:!!p.isPlaying(),pos:p.getPosition()||0,dur:p.getDuration()||0,load:!!p.isLoading()}}catch(e){return}
- const k=[s.song,s.playing,s.load,Math.round(s.dur)].join();
+ if(!window.__drs_dbg){window.__drs_dbg=1;try{const f=o=>{const r=[];for(const k in o){try{r.push(k+':'+typeof o[k])}catch(e){}}return r};send({t:'dbg',v:JSON.stringify({p:f(p),c:f(p.control||{}),s:[...document.scripts].map(x=>x.src).filter(Boolean)})})}catch(e){}}
+
+ try{s={t:'st',song:Number(p.getSongId())||0,playing:!!p.isPlaying(),pos:p.getPosition()||0,dur:p.getDuration()||0,load:!!p.isLoading()};setQ(p);s.q=String(p.control.getAudioQuality()||'');s.flac=!!(p.html5&&p.html5.flac)}catch(e){return}
+ const k=[s.song,s.playing,s.load,Math.round(s.dur),s.q].join();
  if(k!==last||s.playing){last=k;send(s)}},500);
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',who);else who();
 })();"#;
@@ -58,7 +63,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 pub enum WebMsg {
     /// id = 0 : pas connecté
     User { id: u64, name: String, pic: String, offer: String },
-    State { song: u64, playing: bool, pos: f32, dur: f32, loading: bool },
+    State { song: u64, playing: bool, pos: f32, dur: f32, loading: bool, quality: String, flac: bool },
     Gw { id: u64, err: String },
     /// page hors www.deezer.com (page de connexion)
     Page,
@@ -85,11 +90,19 @@ fn parse(s: &str) -> Option<WebMsg> {
             pos: v["pos"].as_f64().unwrap_or(0.0) as f32,
             dur: v["dur"].as_f64().unwrap_or(0.0) as f32,
             loading: v["load"].as_bool().unwrap_or(false),
+            quality: st("q"),
+            flac: v["flac"].as_bool().unwrap_or(false),
         },
         "gw" => WebMsg::Gw { id: v["id"].as_u64().unwrap_or(0), err: st("err") },
         "page" => WebMsg::Page,
         "noplayer" => WebMsg::NoPlayer,
         "arl" => WebMsg::Arl(st("v")),
+        "dbg" => {
+            if std::env::var_os("DEEZER_PROF").is_some() {
+                eprintln!("web dbg: {}", st("v"));
+            }
+            return None;
+        }
         _ => return None,
     })
 }
@@ -103,11 +116,12 @@ fn wry_rect(r: egui::Rect) -> Rect {
 
 impl Web {
     /// `arl` : cookie de session sauvegardé, réinjecté avant le premier chargement pour rester connecté.
-    pub fn new(frame: &eframe::Frame, ctx: egui::Context, url: &str, visible: bool, bounds: egui::Rect, arl: &str) -> Result<Self, String> {
+    pub fn new(frame: &eframe::Frame, ctx: egui::Context, url: &str, visible: bool, bounds: egui::Rect, arl: &str, quality: &str) -> Result<Self, String> {
         let (tx, rx) = channel();
         // session sauvegardée : le script de page la remet en cookie si WebKit l'a perdue
         let arl: String = arl.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        let init = format!("window.__drs_arl={};{INIT_JS}", serde_json::to_string(&arl).unwrap_or_default());
+        let q = if crate::config::QUALITIES.contains(&quality) { quality } else { "" };
+        let init = format!("window.__drs_arl={};window.__drs_q={:?};{INIT_JS}", serde_json::to_string(&arl).unwrap_or_default(), q);
         let view = WebViewBuilder::new()
             .with_url(url)
             .with_user_agent(UA)
@@ -161,6 +175,14 @@ impl Web {
 
     pub fn play(&self, track: u64) {
         self.js(&format!("window.__drs_play&&window.__drs_play({track})"));
+    }
+
+    /// Qualité audio du lecteur officiel (s'applique au prochain chargement de morceau).
+    pub fn set_quality(&self, q: &str) {
+        // "" = réglage du compte : on cesse simplement d'imposer une qualité
+        if q.is_empty() || crate::config::QUALITIES.contains(&q) {
+            self.js(&format!("window.__drs_setq&&window.__drs_setq('{q}')"));
+        }
     }
 
     pub fn control(&self, f: &str, args: &str) {

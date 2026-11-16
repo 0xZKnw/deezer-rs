@@ -20,11 +20,13 @@ pub struct Config {
     pub auto_update: bool,
     /// copie du cookie de session Deezer (« arl ») pour rester connecté (fichier en 0600)
     pub arl: String,
+    /// qualité audio du lecteur Deezer : "" (réglage du compte), standard, high, lossless
+    pub quality: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { app_id: String::new(), secret: String::new(), token: String::new(), port: 8765, volume: 0.8, user_id: 0, web: false, aurora: true, auto_update: true, arl: String::new() }
+        Self { app_id: String::new(), secret: String::new(), token: String::new(), port: 8765, volume: 0.8, user_id: 0, web: false, aurora: true, auto_update: true, arl: String::new(), quality: String::new() }
     }
 }
 
@@ -48,6 +50,9 @@ pub fn cache_dir() -> PathBuf {
     }
 }
 
+/// Qualités acceptées par `dzPlayer.control.setAudioQuality` du lecteur web officiel.
+pub const QUALITIES: [&str; 3] = ["standard", "high", "lossless"];
+
 impl Config {
     fn path() -> PathBuf {
         config_dir().join("config.json")
@@ -65,6 +70,7 @@ impl Config {
                 c.aurora = v["aurora"].as_bool().unwrap_or(true);
                 c.auto_update = v["auto_update"].as_bool().unwrap_or(true);
                 c.arl = v["arl"].as_str().unwrap_or("").into();
+                c.quality = v["quality"].as_str().filter(|q| QUALITIES.contains(q)).unwrap_or("").into();
                 if let Some(p) = v["port"].as_u64() {
                     c.port = p as u16;
                 }
@@ -81,7 +87,7 @@ impl Config {
         let _ = fs::create_dir_all(&dir);
         let v = json!({
             "app_id": self.app_id, "secret": self.secret, "token": self.token,
-            "port": self.port, "volume": self.volume, "user_id": self.user_id, "web": self.web, "aurora": self.aurora, "auto_update": self.auto_update, "arl": self.arl,
+            "port": self.port, "volume": self.volume, "user_id": self.user_id, "web": self.web, "aurora": self.aurora, "auto_update": self.auto_update, "arl": self.arl, "quality": self.quality,
         });
         let tmp = dir.join("config.json.tmp");
         if fs::write(&tmp, serde_json::to_vec_pretty(&v).unwrap()).is_ok() {

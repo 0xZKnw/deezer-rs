@@ -38,6 +38,9 @@ pub struct Library {
 pub struct CarState {
     pub off: f32,
     pub anim: Option<(f32, f32, Instant)>,
+    /// zone et défilement max de la frame précédente (molette gérée à la main)
+    pub rect: Option<egui::Rect>,
+    pub max: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +62,7 @@ pub struct PageState {
     pub dirty: bool,
     pub sort: Option<(Col, bool)>,
     pub filter: String,
+    pub expanded: bool,
 }
 
 impl PageState {
@@ -227,7 +231,7 @@ pub struct App {
     /// paroles du morceau `.0`
     pub lyrics: Option<(u64, crate::lyrics::Lyrics)>,
     /// défilement manuel des paroles (décalage, instant) : suspend le suivi auto quelques secondes
-    pub ly_manual: Option<(f32, Instant)>,
+    pub ly: crate::ui::LyAnim,
 }
 
 #[derive(Clone, Copy)]
@@ -238,11 +242,15 @@ pub struct WebState {
     pub dur: f32,
     pub loading: bool,
     pub at: Instant,
+    /// qualité réellement utilisée par le lecteur (standard / high / lossless)
+    pub quality: &'static str,
+    /// le moteur web sait lire le FLAC
+    pub flac: bool,
 }
 
 impl Default for WebState {
     fn default() -> Self {
-        Self { song: 0, playing: false, pos: 0.0, dur: 0.0, loading: false, at: Instant::now() }
+        Self { song: 0, playing: false, pos: 0.0, dur: 0.0, loading: false, at: Instant::now(), quality: "", flac: false }
     }
 }
 
@@ -332,7 +340,7 @@ impl App {
             np_t0: Instant::now(),
             show_lyrics: false,
             lyrics: None,
-            ly_manual: None,
+            ly: Default::default(),
         };
         if app.cfg.web {
             // session Deezer mémorisée par WebKit : on relance le lecteur officiel en arrière-plan
@@ -430,7 +438,7 @@ impl App {
         }
         let keep_filter = std::mem::take(&mut self.page.filter);
         let keep_sort = self.page.sort.or(sort);
-        self.page = PageState { data: d, loading: false, err: String::new(), view: vec![], dirty: true, sort: keep_sort, filter: keep_filter };
+        self.page = PageState { data: d, loading: false, err: String::new(), view: vec![], dirty: true, sort: keep_sort, filter: keep_filter, expanded: false };
     }
 
     pub fn is_library_route(&self) -> bool {
@@ -922,7 +930,7 @@ impl App {
                     self.np_t0 = Instant::now();
                 }
                 self.now_playing = on && self.cur.is_some();
-                self.ly_manual = None;
+                self.ly.reset();
             }
             Act::ToggleLyrics => {
                 if !self.now_playing {
@@ -932,7 +940,7 @@ impl App {
                 } else {
                     self.show_lyrics = !self.show_lyrics;
                 }
-                self.ly_manual = None;
+                self.ly.reset();
             }
             Act::Repeat => {
                 self.repeat = match self.repeat {
@@ -1170,10 +1178,10 @@ impl App {
                         }
                     }
                 }
-                WebMsg::State { song, playing, pos, dur, loading } => {
+                WebMsg::State { song, playing, pos, dur, loading, quality, flac } => {
                     let prev = std::mem::replace(
                         &mut self.ws,
-                        WebState { song, playing, pos, dur, loading, at: Instant::now() },
+                        WebState { song, playing, pos, dur, loading, at: Instant::now(), quality: crate::config::QUALITIES.into_iter().find(|q| *q == quality).unwrap_or(""), flac },
                     );
                     if self.cur.is_none() || !self.use_web() {
                         continue;
@@ -1240,7 +1248,7 @@ impl App {
             if let Some(id) = self.cur.as_ref().map(|t| t.id) {
                 if self.lyrics.as_ref().map(|l| l.0) != Some(id) {
                     self.lyrics = Some((id, crate::lyrics::Lyrics::Loading));
-                    self.ly_manual = None;
+                    self.ly.reset();
                     let (arl, tx, ctx) = (if self.use_web() { self.cfg.arl.clone() } else { String::new() }, self.tx.clone(), self.ctx.clone());
                     std::thread::spawn(move || {
                         let l = crate::lyrics::fetch(&arl, id);

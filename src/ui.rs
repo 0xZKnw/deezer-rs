@@ -435,6 +435,91 @@ fn explicit_badge(p: &Painter, pos: Pos2) -> f32 {
 }
 
 /// Bouton primaire rond : blanc, icône sombre.
+/// Défilement des paroles : ressort amorti (léger rebond), cascade ligne par ligne,
+/// galleys mis en cache par morceau. Aucun calcul tant que rien ne bouge.
+#[derive(Default)]
+pub struct LyAnim {
+    key: (u64, u32, usize),
+    galleys: Vec<Option<Arc<egui::Galley>>>,
+    big: Vec<Option<Arc<egui::Galley>>>,
+    starts: Vec<u32>,
+    ys: Vec<f32>,
+    hs: Vec<f32>,
+    hb: Vec<f32>,
+    gap: f32,
+    total: f32,
+    synced: bool,
+    cur: Option<usize>,
+    from: Vec<f32>,
+    target: f32,
+    t0: Option<Instant>,
+    dur: f32,
+    stagger: bool,
+    anchor: usize,
+    manual: Option<Instant>,
+}
+
+const LY_SMALL: f32 = 22.0;
+const LY_BIG: f32 = 34.0;
+
+/// Axe dominant du geste de défilement en cours (0 = horizontal, 1 = vertical), verrouillé
+/// tant que le geste continue (pause < 180 ms) : évite que x et y se mélangent.
+fn scroll_axis(ui: &Ui) -> Option<u8> {
+    use std::cell::Cell;
+    thread_local!(static LOCK: Cell<(u8, f64)> = const { Cell::new((1, 0.0)) });
+    let (d, t) = ui.input(|i| (i.smooth_scroll_delta, i.time));
+    LOCK.with(|l| {
+        let (ax, last) = l.get();
+        if d == egui::Vec2::ZERO {
+            return (t - last < 0.18).then_some(ax);
+        }
+        let ax = if t - last < 0.18 { ax } else if d.x.abs() > d.y.abs() { 0 } else { 1 };
+        l.set((ax, t));
+        Some(ax)
+    })
+}
+
+/// Ressort amorti normalisé (ζ ≈ 0,76) : 0 → 1 avec ~2,5 % de dépassement.
+fn spring(u: f32) -> f32 {
+    if u <= 0.0 {
+        0.0
+    } else if u >= 1.6 {
+        1.0
+    } else {
+        1.0 - (-7.0 * u).exp() * ((6.0 * u).cos() + 7.0 / 6.0 * (6.0 * u).sin())
+    }
+}
+
+impl LyAnim {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn delay(&self, i: usize) -> f32 {
+        if !self.stagger {
+            return 0.0;
+        }
+        ((i as f32 - self.anchor as f32 + 1.0).max(0.0) * 0.05).min(0.45)
+    }
+    fn value(&self, i: usize, now: Instant) -> f32 {
+        let Some(t0) = self.t0 else { return self.from.get(i).copied().unwrap_or(self.target) };
+        let t = now.duration_since(t0).as_secs_f32() - self.delay(i);
+        let from = self.from.get(i).copied().unwrap_or(self.target);
+        from + (self.target - from) * spring(t / self.dur.max(0.05))
+    }
+    fn retarget(&mut self, target: f32, stagger: bool, anchor: usize, dur: f32, now: Instant) {
+        let from: Vec<f32> = (0..self.galleys.len()).map(|i| self.value(i, now)).collect();
+        self.from = from;
+        self.target = target;
+        self.t0 = Some(now);
+        self.dur = dur;
+        self.stagger = stagger;
+        self.anchor = anchor;
+    }
+    fn moving(&self, now: Instant) -> bool {
+        self.t0.is_some_and(|t0| now.duration_since(t0).as_secs_f32() < self.dur * 1.6 + if self.stagger { 0.45 } else { 0.0 })
+    }
+}
+
 /// Piste de curseur (progression, volume) : fond translucide, remplissage, bouton au survol.
 fn slider(p: &Painter, bar: Rect, frac: f32, k: f32, fill: Color32) {
     let bar = bar.expand2(vec2(0.0, k));
@@ -675,10 +760,22 @@ fn section_ui(ui: &mut Ui, cx: &mut Cx, offs: &mut HashMap<String, CarState>, s:
     }
     match s.style {
         Style::Carousel => {
+            // molette/trackpad gérés à la main avec verrouillage d'axe : un geste vertical au-dessus
+            // d'un carrousel fait défiler la page, un geste horizontal le carrousel, jamais les deux
             let mut sa = ScrollArea::horizontal()
                 .id_salt(&key)
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .scroll_source(egui::scroll_area::ScrollSource { scroll_bar: false, drag: egui::scroll_area::DragScroll::OnTouch, mouse_wheel: false })
                 .auto_shrink([false, true]);
+            if st.rect.is_some_and(|r| ui.rect_contains_pointer(r)) && scroll_axis(ui) == Some(0) {
+                let dx = ui.input(|i| i.smooth_scroll_delta.x);
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                if dx != 0.0 {
+                    st.anim = None;
+                    st.off = (st.off - dx).clamp(0.0, st.max.max(0.0));
+                    sa = sa.horizontal_scroll_offset(st.off);
+                }
+            }
             if let Some((from, to, t0)) = st.anim {
                 let k = (t0.elapsed().as_secs_f32() / 0.45).min(1.0);
                 let e = 1.0 - (1.0 - k).powi(3);
@@ -699,6 +796,8 @@ fn section_ui(ui: &mut Ui, cx: &mut Cx, offs: &mut HashMap<String, CarState>, s:
                 });
             });
             st.off = out.state.offset().x;
+            st.rect = Some(out.inner_rect);
+            st.max = out.content_size.x - out.inner_rect.width();
         }
         Style::Tiles => {
             let gap = 12.0;
@@ -819,7 +918,7 @@ fn track_table(ui: &mut Ui, cx: &mut Cx, ps: &mut PageState, playlist_ctx: Optio
     ui.painter().hline(hr.x_range(), hr.bottom(), Stroke::new(1.0, LINE));
     ui.add_space(4.0);
 
-    let n = ps.view.len();
+    let n = if ps.data.preview > 0 && !ps.expanded && ps.filter.is_empty() { ps.view.len().min(ps.data.preview) } else { ps.view.len() };
     let (area, _) = ui.allocate_exact_size(vec2(w, n as f32 * ROW_H), Sense::hover());
     let clip = ui.clip_rect();
     let first = (((clip.min.y - area.min.y) / ROW_H).floor().max(0.0)) as usize;
@@ -1137,6 +1236,15 @@ pub fn page_ui(ui: &mut Ui, cx: &mut Cx, ps: &mut PageState, offs: &mut HashMap<
             _ => None,
         };
         track_table(ui, cx, ps, pl);
+        let pv = ps.data.preview;
+        if pv > 0 && ps.filter.is_empty() && ps.view.len() > pv {
+            ui.add_space(10.0);
+            let label = if ps.expanded { "Show less".to_owned() } else { format!("Show all {} tracks", ps.view.len()) };
+            if pill(ui, &label, false).clicked() {
+                ps.expanded = !ps.expanded;
+            }
+            ui.add_space(8.0);
+        }
         if ps.view.is_empty() && !ps.filter.is_empty() {
             ui.add_space(20.0);
             ui.label(RichText::new("No tracks match your search").color(MUTED));
@@ -1382,74 +1490,168 @@ impl App {
         let (pos, len) = self.play_pos();
         let full = self.use_web();
         let App { imgs, lib, acts, cur, loading, shuffle, repeat, volume, seeking, show_queue, vol_before_mute, now_playing, show_lyrics, .. } = self;
-        // dock flottant : panneau arrondi détaché des bords, ombre noire, filet clair en haut
-        Panel::bottom("player").exact_size(96.0).resizable(false).frame(Frame::new().inner_margin(Margin { left: 12, right: 12, top: 2, bottom: 12 })).show(ui, |ui| {
+        // dock : transport à gauche, capsule « en cours » centrée (pochette, titre, progression), réglages à droite
+        Panel::bottom("player").exact_size(92.0).resizable(false).frame(Frame::new().inner_margin(Margin { left: 12, right: 12, top: 2, bottom: 12 })).show(ui, |ui| {
             let dock = ui.max_rect();
             let p = ui.painter().clone();
-            p.add(Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(165) }.as_shape(dock, CornerRadius::same(22)));
-            p.rect(dock, CornerRadius::same(22), Color32::from_rgba_premultiplied(17, 17, 21, 246), Stroke::new(1.0, LINE), StrokeKind::Inside);
-            p.hline(dock.x_range().shrink(24.0), dock.top() + 1.0, Stroke::new(1.0, Color32::from_white_alpha(10)));
-            let rect = dock.shrink2(vec2(13.0, 0.0));
+            // même matière que la barre latérale (sombre, légèrement translucide) + filet clair en haut
+            p.add(Shadow { offset: [0, 14], blur: 44, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(dock, CornerRadius::same(24)));
+            p.rect(dock, CornerRadius::same(24), SIDE.gamma_multiply(0.92), Stroke::new(1.0, LINE), StrokeKind::Inside);
+            p.hline(dock.x_range().shrink(28.0), dock.top() + 1.0, Stroke::new(1.0, Color32::from_white_alpha(11)));
+            let rect = dock.shrink2(vec2(10.0, 0.0));
             let cy = rect.center().y;
-            let cx_ = rect.center().x;
-            let bw = (rect.width() * 0.36).clamp(240.0, 560.0);
+            let x0 = rect.min.x;
+            let rx = rect.right() - 12.0;
 
-            // gauche : pochette + infos, cœur et « + » juste après le texte
+            // ---- gauche : transport
+            let btn = |ui: &mut Ui, x: f32, ic: Ic, size: f32, active: bool, id: &str| -> bool {
+                let r = Rect::from_center_size(pos2(x, cy), vec2(34.0, 34.0));
+                let resp = ui.interact(r, ui.scope_id().with(id), Sense::click());
+                let h = anim(ui, resp.id.with("h"), resp.hovered(), 0.12);
+                let press = if resp.is_pointer_button_down_on() { 0.9 } else { 1.0 };
+                if h > 0.01 {
+                    ui.painter().circle_filled(r.center(), 16.0, Color32::from_white_alpha((10.0 * h) as u8));
+                }
+                icons::draw(ui.painter(), ic, r.center(), size * press, if active { INK } else { MUTED.lerp_to_gamma(INK, h) });
+                if active {
+                    ui.painter().circle_filled(pos2(x, cy + 15.0), 1.7, acc_text());
+                }
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            };
+            if btn(ui, x0 + 17.0, Ic::Shuffle, 15.0, *shuffle, "b_shuf") {
+                acts.push(Act::Shuffle);
+            }
+            if btn(ui, x0 + 58.0, Ic::Prev, 17.0, false, "b_prev") {
+                acts.push(Act::Prev);
+            }
+            let pc = pos2(x0 + 104.0, cy);
+            let presp = ui.interact(Rect::from_center_size(pc, vec2(44.0, 44.0)), ui.scope_id().with("b_play"), Sense::click());
+            let ph = anim(ui, ui.scope_id().with("ph"), presp.hovered(), 0.14);
+            let press = if presp.is_pointer_button_down_on() { 0.92 } else { 1.0 };
+            let pr_ = (20.0 + 1.0 * ph) * press;
+            p.circle_filled(pc + vec2(0.0, 2.0), pr_, Color32::from_black_alpha(70));
+            p.circle_filled(pc, pr_, INK.lerp_to_gamma(Color32::WHITE, ph));
+            if *loading {
+                ui.put(Rect::from_center_size(pc, vec2(16.0, 16.0)), egui::Spinner::new().color(BG));
+            } else {
+                icons::draw(&p, if playing { Ic::Pause } else { Ic::Play }, pc + vec2(if playing { 0.0 } else { 1.3 }, 0.0), 15.0 * press, BG);
+            }
+            if presp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                acts.push(Act::Toggle);
+            }
+            if btn(ui, x0 + 150.0, Ic::Next, 17.0, false, "b_next") {
+                acts.push(Act::Next);
+            }
+            let rep_ic = if *repeat == Repeat::One { Ic::RepeatOne } else { Ic::Repeat };
+            if btn(ui, x0 + 191.0, rep_ic, 15.0, *repeat != Repeat::Off, "b_rep") {
+                acts.push(Act::Repeat);
+            }
+
+            // ---- centre : capsule
+            let cx_ = rect.center().x;
+            let hw = (cx_ - (x0 + 228.0)).min(rx - 214.0 - cx_).min(330.0).max(150.0);
+            // capsule « creusée », même traitement que le champ de recherche ; rayons concentriques
+            let cap = Rect::from_center_size(pos2(cx_, cy), vec2(hw * 2.0, 58.0));
+            let cresp = ui.interact(cap, ui.scope_id().with("pl_cap"), Sense::click());
+            let ch = anim(ui, cresp.id.with("h"), cresp.contains_pointer(), 0.16);
+            p.rect(cap, CornerRadius::same(18), Color32::from_rgba_premultiplied(5, 5, 7, 165).lerp_to_gamma(HOVER, ch * 0.5), Stroke::new(1.0, LINE.lerp_to_gamma(Color32::from_white_alpha(34), ch)), StrokeKind::Inside);
             if let Some(t) = cur.as_ref() {
-                let img = Rect::from_center_size(pos2(rect.min.x + 28.0, cy), vec2(56.0, 56.0));
-                shadow(&p, img, 8, 0.7);
-                imgs.paint(&p, img, &t.img, 120, 8);
-                let tx = img.right() + 14.0;
-                let tw = (cx_ - bw / 2.0 - 64.0 - tx - 80.0).clamp(90.0, 300.0);
-                let tg = galley(&p, &t.title, med(14.5), INK, tw);
-                let ag = galley(&p, &t.artist, reg(13.0), MUTED, tw);
-                let tr = Rect::from_min_size(pos2(tx, cy - 19.0), tg.size());
-                let ar = Rect::from_min_size(pos2(tx, cy + 2.0), ag.size());
-                // pochette + titre cliquables : ouvre / ferme la vue « Now Playing »
-                let nresp = ui.interact(img.union(tr), ui.scope_id().with("pl_np"), Sense::click());
-                let nh = anim(ui, nresp.id.with("h"), nresp.hovered(), 0.14);
-                if nh > 0.01 {
-                    p.rect_filled(img, CornerRadius::same(8), Color32::from_black_alpha((130.0 * nh) as u8));
+                let img = Rect::from_min_size(pos2(cap.min.x + 6.0, cap.min.y + 6.0), vec2(46.0, 46.0));
+                shadow(&p, img, 12, 0.6);
+                imgs.paint(&p, img, &t.img, 120, 12);
+                let ah = anim(ui, ui.scope_id().with("pl_arth"), cresp.hovered(), 0.14);
+                if ah > 0.01 {
+                    p.rect_filled(img, CornerRadius::same(12), Color32::from_black_alpha((120.0 * ah) as u8));
                     let c = img.center();
                     let d = if *now_playing { 1.0 } else { -1.0 };
-                    p.add(egui::epaint::PathShape::line(vec![c + vec2(-7.0, -3.5 * d), c + vec2(0.0, 3.5 * d), c + vec2(7.0, -3.5 * d)], Stroke::new(2.0, INK.gamma_multiply(nh))));
+                    p.add(egui::epaint::PathShape::line(vec![c + vec2(-6.5, -3.2 * d), c + vec2(0.0, 3.2 * d), c + vec2(6.5, -3.2 * d)], Stroke::new(2.0, INK.gamma_multiply(ah))));
                 }
-                if nresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if *now_playing { "Close" } else { "Now playing" }).clicked() {
+                if cresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     acts.push(Act::NowPlaying(!*now_playing));
                 }
-                p.galley(tr.min, tg, INK);
-                let mut tend = tr.right();
+                // zone texte : entre la pochette et le cœur, contenu centré
+                let tl = img.right() + 12.0;
+                let tr_ = cap.right() - 66.0;
+                let tcx = (tl + tr_) / 2.0;
+                let tw = (tr_ - tl).max(40.0);
+                let tg = galley(&p, &t.title, med(13.5), INK, tw - if t.explicit { 22.0 } else { 0.0 });
+                let sub = if full { t.artist.clone() } else { format!("{} · 30 s preview", t.artist) };
+                let ag = galley(&p, &sub, reg(12.0), MUTED, tw);
+                let tot_w = tg.size().x + if t.explicit { 22.0 } else { 0.0 };
+                let tpos = pos2(tcx - tot_w / 2.0, cap.min.y + 9.0);
                 if t.explicit {
-                    explicit_badge(&p, pos2(tr.right() + 6.0, cy - 17.0));
-                    tend += 22.0;
+                    explicit_badge(&p, pos2(tpos.x + tg.size().x + 6.0, tpos.y + 2.0));
                 }
+                p.galley(tpos, tg, INK);
+                let ar = Rect::from_min_size(pos2(tcx - ag.size().x / 2.0, cap.min.y + 27.0), ag.size());
                 p.galley(ar.min, ag, MUTED);
-                let aresp = ui.interact(ar.expand(2.0), ui.scope_id().with("pl_artist"), Sense::click());
+                let aresp = ui.interact(ar.expand(1.0), ui.scope_id().with("pl_artist"), Sense::click());
                 if aresp.hovered() {
                     p.hline(ar.x_range(), ar.bottom(), Stroke::new(1.0, MUTED));
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                if aresp.clicked() && t.artist_id != 0 {
+                if aresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && t.artist_id != 0 {
                     acts.push(Act::Go(Route::Artist(t.artist_id)));
                 }
-                let hx = tend.max(ar.right()) + 24.0;
+
+                // progression : filet de 3 px au pied de la capsule, temps au survol
+                let bar = Rect::from_min_size(pos2(tl, cap.max.y - 9.0), vec2(cap.right() - 14.0 - tl, 3.0));
+                let sresp = ui.interact(bar.expand2(vec2(4.0, 6.0)), ui.scope_id().with("seek"), Sense::click_and_drag());
+                let total = len.as_secs_f32().max(0.001);
+                let frac_now = (pos.as_secs_f32() / total).clamp(0.0, 1.0);
+                let ptr = sresp.hover_pos().or(sresp.interact_pointer_pos()).map(|q| ((q.x - bar.min.x) / bar.width()).clamp(0.0, 1.0));
+                if (sresp.dragged() || sresp.clicked()) && ptr.is_some() {
+                    *seeking = ptr;
+                }
+                let shown = seeking.unwrap_or(frac_now);
+                let kn = anim(ui, ui.scope_id().with("kn"), sresp.hovered() || sresp.dragged(), 0.12);
+                // remplissage à la teinte de la pochette (la même que l'aurora), sans dégradé
+                slider(&p, bar, shown, kn, acc_text().lerp_to_gamma(INK, 0.25 * (1.0 - kn)));
+                if sresp.drag_stopped() || sresp.clicked() {
+                    if let Some(f) = seeking.take() {
+                        acts.push(Act::Seek(f));
+                    }
+                }
+                if ch > 0.01 && kn < 0.99 {
+                    let a = ch * (1.0 - kn);
+                    let ts = (shown * total) as u32;
+                    let tt = len.as_secs() as u32;
+                    let g = galley(&p, &format!("{}:{:02}", ts / 60, ts % 60), reg(10.5), FAINT, 50.0);
+                    p.galley(pos2(bar.min.x, bar.min.y - 4.0 - g.size().y), g, FAINT.gamma_multiply(a));
+                    let g = galley(&p, &format!("{}:{:02}", tt / 60, tt % 60), reg(10.5), FAINT, 50.0);
+                    p.galley(pos2(bar.max.x - g.size().x, bar.min.y - 4.0 - g.size().y), g, FAINT.gamma_multiply(a));
+                }
+                if let (Some(f), true) = (ptr, kn > 0.05) {
+                    let s_ = (f * total) as u32;
+                    let g = galley(&p, &format!("{}:{:02}", s_ / 60, s_ % 60), med(11.0), INK, 60.0);
+                    let bx = (bar.min.x + bar.width() * f).clamp(bar.min.x + 18.0, bar.max.x - 18.0);
+                    let bub = Rect::from_center_size(pos2(bx, bar.min.y - 13.0), g.size() + vec2(14.0, 6.0));
+                    p.rect(bub, CornerRadius::same(7), RAISED.gamma_multiply(kn), Stroke::new(1.0, LINE.gamma_multiply(kn)), StrokeKind::Inside);
+                    p.galley(bub.center() - g.size() / 2.0, g, INK.gamma_multiply(kn));
+                }
+                sresp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                // cœur (toujours) et « + » (au survol), à droite dans la capsule
                 let liked = lib.fav.contains(&t.id);
-                let hr = Rect::from_center_size(pos2(hx, cy), vec2(30.0, 30.0));
+                let hr = Rect::from_center_size(pos2(cap.right() - 24.0, cap.min.y + 22.0), vec2(28.0, 28.0));
                 let hresp = ui.interact(hr, ui.scope_id().with("pl_heart"), Sense::click());
                 let pop = heart_pop(ui, ui.scope_id().with("pl_pop"), liked);
                 if hresp.hovered() {
-                    p.circle_filled(hr.center(), 15.0, HOVER);
+                    p.circle_filled(hr.center(), 14.0, Color32::from_white_alpha(12));
                 }
-                icons::draw(&p, if liked { Ic::Heart } else { Ic::HeartOutline }, hr.center(), 16.0 * pop, if liked { ACCENT } else if hresp.hovered() { INK } else { MUTED });
+                icons::draw(&p, if liked { Ic::Heart } else { Ic::HeartOutline }, hr.center(), 15.5 * pop, if liked { ACCENT } else if hresp.hovered() { INK } else { MUTED });
                 if hresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     acts.push(Act::Like(t.clone()));
                 }
-                let pr = Rect::from_center_size(pos2(hx + 30.0, cy), vec2(30.0, 30.0));
+                let pr = Rect::from_center_size(pos2(cap.right() - 52.0, cap.min.y + 22.0), vec2(26.0, 26.0));
                 let presp = ui.interact(pr, ui.scope_id().with("pl_plus"), Sense::click());
-                if presp.hovered() {
-                    p.circle_filled(pr.center(), 15.0, HOVER);
+                let open_menu = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&presp));
+                let pa = if open_menu { 1.0 } else { ch };
+                if pa > 0.01 {
+                    if presp.hovered() {
+                        p.circle_filled(pr.center(), 13.0, Color32::from_white_alpha(12));
+                    }
+                    icons::draw(&p, Ic::Plus, pr.center(), 14.0, (if presp.hovered() { INK } else { MUTED }).gamma_multiply(pa));
                 }
-                icons::draw(&p, Ic::Plus, pr.center(), 15.0, if presp.hovered() { INK } else { MUTED });
                 let t2 = t.clone();
                 egui::Popup::menu(&presp).show(|ui| {
                     ui.set_min_width(210.0);
@@ -1463,113 +1665,33 @@ impl App {
                         }
                     });
                 });
-            }
-
-            // centre : transport
-            let by = cy - 11.0;
-            let btn = |ui: &mut Ui, x: f32, ic: Ic, size: f32, active: bool, id: &str| -> bool {
-                let r = Rect::from_center_size(pos2(x, by), vec2(34.0, 34.0));
-                let resp = ui.interact(r, ui.scope_id().with(id), Sense::click());
-                let h = anim(ui, resp.id.with("h"), resp.hovered(), 0.12);
-                if h > 0.01 {
-                    ui.painter().circle_filled(r.center(), 16.0, CARD.gamma_multiply(h));
-                }
-                icons::draw(ui.painter(), ic, r.center(), size, if active { INK } else { MUTED.lerp_to_gamma(INK, h) });
-                if active {
-                    ui.painter().circle_filled(pos2(x, by + 14.5), 1.7, acc_text());
-                }
-                resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
-            };
-            if btn(ui, cx_ - 96.0, Ic::Shuffle, 16.0, *shuffle, "b_shuf") {
-                acts.push(Act::Shuffle);
-            }
-            if btn(ui, cx_ - 52.0, Ic::Prev, 17.0, false, "b_prev") {
-                acts.push(Act::Prev);
-            }
-            // play/pause : rond blanc, icône sombre
-            let pc = pos2(cx_, by);
-            let pr = Rect::from_center_size(pc, vec2(40.0, 40.0));
-            let presp = ui.interact(pr, ui.scope_id().with("b_play"), Sense::click());
-            let ph = anim(ui, ui.scope_id().with("ph"), presp.hovered(), 0.14);
-            let press = if presp.is_pointer_button_down_on() { 0.93 } else { 1.0 };
-            p.circle_filled(pc, (18.5 + 1.0 * ph) * press, INK.lerp_to_gamma(Color32::WHITE, ph));
-            if *loading {
-                ui.put(Rect::from_center_size(pc, vec2(16.0, 16.0)), egui::Spinner::new().color(BG));
             } else {
-                icons::draw(&p, if playing { Ic::Pause } else { Ic::Play }, pc + vec2(if playing { 0.0 } else { 1.2 }, 0.0), 14.0 * press, BG);
-            }
-            if presp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                acts.push(Act::Toggle);
-            }
-            if btn(ui, cx_ + 52.0, Ic::Next, 17.0, false, "b_next") {
-                acts.push(Act::Next);
-            }
-            let rep_ic = if *repeat == Repeat::One { Ic::RepeatOne } else { Ic::Repeat };
-            if btn(ui, cx_ + 96.0, rep_ic, 16.0, *repeat != Repeat::Off, "b_rep") {
-                acts.push(Act::Repeat);
+                text_center(&p, cx_, cy - 8.0, "Nothing playing", reg(13.0), FAINT, hw * 2.0);
             }
 
-            // progression : piste fine, s'épaissit au survol, bulle de temps sous le pointeur
-            let bar = Rect::from_min_size(pos2(cx_ - bw / 2.0, cy + 22.0), vec2(bw, 4.0));
-            let sresp = ui.interact(bar.expand2(vec2(4.0, 9.0)), ui.scope_id().with("seek"), Sense::click_and_drag());
-            let total = len.as_secs_f32().max(0.001);
-            let frac_now = (pos.as_secs_f32() / total).clamp(0.0, 1.0);
-            let ptr = sresp.hover_pos().or(sresp.interact_pointer_pos()).map(|q| ((q.x - bar.min.x) / bar.width()).clamp(0.0, 1.0));
-            if (sresp.dragged() || sresp.clicked()) && ptr.is_some() {
-                *seeking = ptr;
-            }
-            let shown = seeking.unwrap_or(frac_now);
-            let kn = anim(ui, ui.scope_id().with("kn"), sresp.hovered() || sresp.dragged(), 0.12);
-            slider(&p, bar, shown, kn, INK.lerp_to_gamma(acc_text(), kn));
-            if sresp.drag_stopped() || sresp.clicked() {
-                if let Some(f) = seeking.take() {
-                    acts.push(Act::Seek(f));
-                }
-            }
-            if let (Some(f), true) = (ptr, kn > 0.05 && cur.is_some()) {
-                let s = (f * total) as u32;
-                let g = galley(&p, &format!("{}:{:02}", s / 60, s % 60), med(11.0), INK, 60.0);
-                let bx = (bar.min.x + bar.width() * f).clamp(bar.min.x + 18.0, bar.max.x - 18.0);
-                let bub = Rect::from_center_size(pos2(bx, bar.min.y - 15.0), g.size() + vec2(14.0, 6.0));
-                p.rect(bub, CornerRadius::same(7), RAISED.gamma_multiply(kn), Stroke::new(1.0, LINE), StrokeKind::Inside);
-                p.galley(bub.center() - g.size() / 2.0, g, INK.gamma_multiply(kn));
-            }
-            sresp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            let tshow = (shown * total) as u32;
-            let tot = len.as_secs() as u32;
-            let g = galley(&p, &format!("{}:{:02}", tshow / 60, tshow % 60), reg(11.5), MUTED, 60.0);
-            p.galley(pos2(bar.min.x - 12.0 - g.size().x, bar.center().y - g.size().y / 2.0), g, MUTED);
-            let g = galley(&p, &format!("{}:{:02}", tot / 60, tot % 60), reg(11.5), FAINT, 60.0);
-            p.galley(pos2(bar.max.x + 12.0, bar.center().y - g.size().y / 2.0), g, FAINT);
-            if cur.is_some() && !full {
-                text_center(&p, cx_, rect.min.y + 4.0, "30-second preview", reg(10.0), FAINT, 200.0);
-            }
-
-            // droite : volume | paroles, file d'attente (état actif = point d'accent, comme shuffle)
-            let rx = rect.right() - 12.0;
-            let toggle = |ui: &mut Ui, x: f32, ic: Ic, on: bool, id: &str, tip: &str| -> bool {
+            // ---- droite : paroles, file d'attente | volume
+            let toggle = |ui: &mut Ui, x: f32, ic: Ic, on: bool, id: &str| -> bool {
                 let r = Rect::from_center_size(pos2(x, cy), vec2(34.0, 34.0));
                 let resp = ui.interact(r, ui.scope_id().with(id), Sense::click());
                 let h = anim(ui, resp.id.with("h"), resp.hovered(), 0.12);
-                if h > 0.01 {
-                    ui.painter().circle_filled(r.center(), 16.0, CARD.gamma_multiply(h));
+                let k = anim(ui, resp.id.with("on"), on, 0.18);
+                let bg = 10.0 * h + 10.0 * k;
+                if bg > 0.3 {
+                    ui.painter().circle_filled(r.center(), 16.0, Color32::from_white_alpha(bg as u8));
                 }
-                icons::draw(ui.painter(), ic, r.center(), 16.0, if on { INK } else { MUTED.lerp_to_gamma(INK, h) });
-                if on {
-                    ui.painter().circle_filled(pos2(x, cy + 14.5), 1.7, acc_text());
-                }
-                resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                icons::draw(ui.painter(), ic, r.center(), 16.0, MUTED.lerp_to_gamma(INK, h.max(k)));
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
             };
-            if toggle(ui, rx, Ic::Queue, *show_queue, "b_queue", "Queue") {
+            if toggle(ui, rx, Ic::Queue, *show_queue, "b_queue") {
                 *show_queue = !*show_queue;
             }
-            if toggle(ui, rx - 38.0, Ic::Lyrics, *now_playing && *show_lyrics, "b_lyrics", "Lyrics") && cur.is_some() {
+            if toggle(ui, rx - 40.0, Ic::Lyrics, *now_playing && *show_lyrics, "b_lyrics") && cur.is_some() {
                 acts.push(Act::ToggleLyrics);
             }
-            p.vline(rx - 62.0, egui::Rangef::new(cy - 10.0, cy + 10.0), Stroke::new(1.0, LINE));
-            let vw = 92.0;
-            let vbar = Rect::from_min_size(pos2(rx - 80.0 - vw, cy - 2.0), vec2(vw, 4.0));
-            let vresp = ui.interact(vbar.expand2(vec2(4.0, 10.0)), ui.scope_id().with("vol"), Sense::click_and_drag());
+            p.vline(rx - 63.0, egui::Rangef::new(cy - 10.0, cy + 10.0), Stroke::new(1.0, LINE));
+            let vw = 84.0;
+            let vbar = Rect::from_min_size(pos2(rx - 80.0 - vw, cy - 1.5), vec2(vw, 3.0));
+            let vresp = ui.interact(vbar.expand2(vec2(4.0, 11.0)), ui.scope_id().with("vol"), Sense::click_and_drag());
             if let Some(px) = vresp.interact_pointer_pos() {
                 if vresp.dragged() || vresp.clicked() {
                     acts.push(Act::Volume(((px.x - vbar.min.x) / vbar.width()).clamp(0.0, 1.0)));
@@ -1705,13 +1827,23 @@ impl App {
             self.drag_area(ui, top, "npdrag");
             let p = ui.painter().clone();
             // fermer
-            let cb = Rect::from_center_size(pos2(full.min.x + 104.0, full.min.y + 28.0), vec2(34.0, 34.0));
+            // fermer : grand bouton rond « verre », chevron épais, touche Esc rappelée au survol
+            let cb = Rect::from_center_size(pos2(full.min.x + 112.0, full.min.y + 30.0), vec2(44.0, 44.0));
             let cr = ui.interact(cb, ui.scope_id().with("np_close"), Sense::click());
-            if cr.hovered() {
-                p.circle_filled(cb.center(), 16.0, HOVER);
+            let ch = anim(ui, cr.id.with("h"), cr.hovered(), 0.14);
+            let press = if cr.is_pointer_button_down_on() { 0.94 } else { 1.0 };
+            let rad = (21.0 + 1.0 * ch) * press;
+            p.circle(cb.center(), rad, Color32::from_white_alpha((14.0 + 14.0 * ch) as u8), Stroke::new(1.0, Color32::from_white_alpha((16.0 + 14.0 * ch) as u8)));
+            let c = cb.center() + vec2(0.0, 1.0 + 1.5 * ch);
+            let s = 7.0 * press;
+            p.add(egui::epaint::PathShape::line(vec![c + vec2(-s, -s * 0.5), c + vec2(0.0, s * 0.5), c + vec2(s, -s * 0.5)], Stroke::new(2.4, INK)));
+            if ch > 0.01 {
+                let kg = galley(&p, "esc", med(10.5), MUTED, 40.0);
+                let kr = Rect::from_min_size(pos2(cb.max.x + 10.0, cb.center().y - 10.0), vec2(kg.size().x + 12.0, 20.0));
+                p.rect(kr, CornerRadius::same(6), Color32::TRANSPARENT, Stroke::new(1.0, Color32::from_white_alpha((28.0 * ch) as u8)), StrokeKind::Inside);
+                p.galley(kr.center() - kg.size() / 2.0, kg, MUTED.gamma_multiply(ch));
             }
-            icons::draw(&p, Ic::Down, cb.center(), 15.0, if cr.hovered() { INK } else { SECOND });
-            if cr.on_hover_text("Close (Esc)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            if cr.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.acts.push(Act::NowPlaying(false));
             }
             let label = Rect::from_center_size(pos2(full.center().x, full.min.y + 28.0), vec2(200.0, 14.0));
@@ -1792,7 +1924,10 @@ impl App {
     }
 
     fn lyrics_panel(&mut self, ui: &mut Ui, r: Rect, pos: Duration, len: Duration, id: u64) {
-        let p = ui.painter().with_clip_rect(r.expand2(vec2(8.0, 0.0)));
+        use crate::lyrics::Lyrics;
+        let playing = self.is_playing();
+        let App { lyrics, ly, acts, .. } = self;
+        let p = ui.painter().with_clip_rect(r.expand2(vec2(12.0, 0.0)));
         let msg = |p: &Painter, title: &str, sub: &str| {
             let g = galley(p, title, display(22.0), SECOND, r.width());
             p.galley(pos2(r.min.x, r.center().y - 30.0), g, SECOND);
@@ -1800,77 +1935,157 @@ impl App {
                 text(p, pos2(r.min.x, r.center().y + 4.0), sub, reg(13.5), MUTED, r.width());
             }
         };
-        let st = match &self.lyrics {
-            Some((lid, l)) if *lid == id => l.clone(),
-            _ => crate::lyrics::Lyrics::Loading,
+        let st = match lyrics {
+            Some((lid, l)) if *lid == id => l,
+            _ => &Lyrics::Loading,
         };
-        let lines: Vec<(u32, String)> = match st {
-            crate::lyrics::Lyrics::Loading => {
+        let (synced, src): (bool, Vec<(u32, &str)>) = match st {
+            Lyrics::Loading => {
                 ui.put(Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(22.0, 22.0)), egui::Spinner::new().color(MUTED));
                 return;
             }
-            crate::lyrics::Lyrics::None => return msg(&p, "No lyrics for this track", ""),
-            crate::lyrics::Lyrics::NeedLogin => return msg(&p, "Lyrics need a Deezer login", "Avatar → Log in to Deezer (full tracks)"),
-            crate::lyrics::Lyrics::Err(e) => return msg(&p, "Couldn't load lyrics", &e),
-            crate::lyrics::Lyrics::Synced(v) => v,
-            crate::lyrics::Lyrics::Plain(v) => v.into_iter().map(|l| (u32::MAX, l)).collect(),
+            Lyrics::None => return msg(&p, "No lyrics for this track", ""),
+            Lyrics::NeedLogin => return msg(&p, "Lyrics need a Deezer login", "Avatar → Log in to Deezer (full tracks)"),
+            Lyrics::Err(e) => return msg(&p, "Couldn't load lyrics", e),
+            Lyrics::Synced(v) => (true, v.iter().map(|(t, l)| (*t, l.as_str())).collect()),
+            Lyrics::Plain(v) => (false, v.iter().map(|l| (u32::MAX, l.as_str())).collect()),
         };
-        let synced = lines.first().is_some_and(|l| l.0 != u32::MAX);
-        let pos_ms = pos.as_millis() as u32 + 200;
-        let cur = if synced { crate::lyrics::current(&lines, pos_ms) } else { None };
-        let font = bold(if synced { 27.0 } else { 21.0 });
-        let gap = if synced { 16.0 } else { 7.0 };
-        // mise en page (galleys en cache côté egui), puis position cible : ligne en cours à ~36 %
-        let gs: Vec<Arc<egui::Galley>> = lines
-            .iter()
-            .map(|(_, l)| p.layout(if l.is_empty() { "♪".to_owned() } else { l.clone() }, font.clone(), Color32::WHITE, r.width()))
-            .collect();
-        let mut ys = Vec::with_capacity(gs.len());
-        let mut y = 0.0;
-        for g in &gs {
-            ys.push(y);
-            y += g.size().y + gap;
+        let now = Instant::now();
+        let w = r.width().min(620.0);
+        // mise en page une seule fois par morceau / largeur (galleys gardés en cache)
+        let key = (id, w as u32, src.len() * 2 + synced as usize);
+        if ly.key != key {
+            ly.reset();
+            ly.key = key;
+            ly.synced = synced;
+            // ligne en cours en grand, les autres plus petites ; la petite version est mise en page
+            // à la largeur réduite pour que le zoom de transition retombe exactement sur elle
+            let font = bold(if synced { LY_SMALL } else { 21.0 });
+            let bigf = bold(LY_BIG);
+            let ratio = LY_SMALL / LY_BIG;
+            let gap = if synced { 16.0 } else { 8.0 };
+            ly.gap = gap;
+            let mut items: Vec<(u32, &str)> = Vec::with_capacity(src.len() + 1);
+            if synced && src.first().is_some_and(|l| l.0 > 2500) {
+                items.push((0, "")); // intro instrumentale : points d'attente
+            }
+            items.extend(src.iter().copied());
+            let mut y = 0.0;
+            for (t, l) in items {
+                let sw = if synced { w * ratio } else { w };
+                let g = (!l.is_empty()).then(|| p.layout(l.to_owned(), font.clone(), Color32::WHITE, sw));
+                let b = (synced && !l.is_empty()).then(|| p.layout(l.to_owned(), bigf.clone(), Color32::WHITE, w));
+                let h = g.as_ref().map(|g| g.size().y).unwrap_or(if synced { 26.0 } else { 6.0 });
+                ly.ys.push(y);
+                ly.hs.push(h);
+                ly.hb.push(b.as_ref().map(|b| b.size().y).unwrap_or(h));
+                ly.big.push(b);
+                ly.starts.push(t);
+                ly.galleys.push(g);
+                y += h + gap;
+            }
+            ly.total = y;
         }
-        let total = y;
-        let max_off = (total - r.height() * 0.5).max(0.0);
-        let target = match cur {
-            Some(i) => ys[i] + gs[i].size().y / 2.0 - r.height() * 0.36,
-            None => -r.height() * 0.2 * synced as i32 as f32,
+        let n = ly.galleys.len();
+        let pos_ms = pos.as_millis() as u32 + 250; // un poil d'avance : le mouvement tombe sur la voix
+        let cur = if synced { crate::lyrics::current(&ly.starts.iter().map(|t| (*t, String::new())).collect::<Vec<_>>(), pos_ms) } else { None };
+        let max_off = (ly.total - r.height() * 0.5).max(0.0);
+        let lo = -r.height() * 0.3;
+        let auto = match cur {
+            Some(i) => ly.ys[i] + ly.hb[i] / 2.0 - r.height() * 0.36,
+            None if synced => -r.height() * 0.12,
+            None => 0.0,
         }
-        .clamp(-r.height() * 0.3, max_off);
-        // molette : défilement manuel, le suivi reprend après 4 s sans geste
+        .clamp(lo, max_off);
+        if ly.t0.is_none() && ly.from.is_empty() {
+            ly.target = auto;
+            ly.from = vec![auto; n];
+        }
+        // molette : défilement libre ; le suivi reprend tout seul après 3,5 s
         if ui.rect_contains_pointer(r) {
             let d = ui.input(|i| i.smooth_scroll_delta.y);
             if d != 0.0 {
-                let base = self.ly_manual.map(|m| m.0).unwrap_or(target);
-                self.ly_manual = Some(((base - d).clamp(-r.height() * 0.3, max_off), Instant::now()));
+                let t = (ly.target - d).clamp(lo, max_off);
+                ly.retarget(t, false, 0, 0.32, now);
+                ly.manual = Some(now);
             }
         }
-        if self.ly_manual.is_some_and(|m| m.1.elapsed() > Duration::from_secs(if synced { 4 } else { 3600 })) {
-            self.ly_manual = None;
+        if synced && ly.manual.is_some_and(|m| now.duration_since(m) > Duration::from_millis(3500)) {
+            ly.manual = None;
+            ly.cur = None;
         }
-        let goal = self.ly_manual.map(|m| m.0).unwrap_or(target);
-        let off = ui.ctx().animate_value_with_time(egui::Id::new(("ly_off", id)), goal, 0.45);
+        if ly.manual.is_none() && (cur != ly.cur || (auto - ly.target).abs() > 1.0) {
+            // changement de ligne : cascade (les lignes du dessous suivent avec un léger retard)
+            let stagger = cur != ly.cur && ly.cur.is_some();
+            ly.retarget(auto, stagger, cur.unwrap_or(0), 0.9, now);
+            ly.cur = cur;
+        }
+        let manual = ly.manual.is_some();
+        let t_now = ui.input(|i| i.time) as f32;
         let len_ms = len.as_millis().max(1) as f32;
-        for (i, g) in gs.into_iter().enumerate() {
-            let top = r.min.y + ys[i] - off;
-            let h = g.size().y;
-            if top + h < r.min.y - 10.0 || top > r.max.y + 10.0 {
+        let mut dots_live = false;
+        let mut grow = 0.0; // hauteur ajoutée par les lignes agrandies au-dessus
+        for i in 0..n {
+            let on = if synced { anim(ui, egui::Id::new(("ly", id, i)), cur == Some(i), 0.42) } else { 0.0 };
+            let top = r.min.y + ly.ys[i] + grow - ly.value(i, now);
+            let h = ly.hs[i] + (ly.hb[i] - ly.hs[i]) * on;
+            grow += h - ly.hs[i];
+            if top + h < r.min.y - 20.0 || top > r.max.y + 20.0 {
                 continue;
             }
-            let lr = Rect::from_min_size(pos2(r.min.x, top), vec2(g.size().x.max(40.0), h));
-            let edge = ((top + h - r.min.y) / 70.0).min((r.max.y - top) / 70.0).clamp(0.0, 1.0);
+            let edge = ((top + h - r.min.y) / 80.0).min((r.max.y - top) / 130.0).clamp(0.0, 1.0);
+            let edge = edge * edge * (3.0 - 2.0 * edge);
+            let Some(g) = ly.galleys[i].clone() else {
+                if !synced {
+                    continue;
+                }
+                // interlude : trois points qui se remplissent jusqu'à la ligne suivante
+                let start = ly.starts[i] as f32;
+                let next = ly.starts.get(i + 1).map(|t| *t as f32).unwrap_or(len_ms);
+                let prog = if cur == Some(i) { ((pos_ms as f32 - start) / (next - start).max(1.0)).clamp(0.0, 1.0) } else { 0.0 };
+                let breathe = if cur == Some(i) { dots_live = true; 1.0 + 0.1 * (t_now * 3.2).sin() * on } else { 1.0 };
+                for k in 0..3 {
+                    let lit = (prog * 3.0 - k as f32).clamp(0.0, 1.0);
+                    let a = (0.22 + 0.78 * lit * on).max(if manual { 0.45 } else { 0.0 }) * edge;
+                    p.circle_filled(pos2(r.min.x + 7.0 + k as f32 * 20.0, top + h / 2.0), 5.5 * breathe, INK.gamma_multiply(a));
+                }
+                continue;
+            };
+            let big = ly.big[i].clone();
+            let sc = LY_SMALL / LY_BIG + (1.0 - LY_SMALL / LY_BIG) * on;
+            let gw = big.as_ref().map(|b| b.size().x * sc).unwrap_or(g.size().x);
+            let lr = Rect::from_min_size(pos2(r.min.x, top), vec2(gw.max(40.0), h));
             let hot = synced && ui.rect_contains_pointer(lr);
-            let on = anim(ui, egui::Id::new(("ly", id, i)), cur == Some(i), 0.3);
-            let base = if synced { 0.30 + 0.25 * hot as i32 as f32 } else { 0.8 };
-            let a = (base + (1.0 - base) * on) * edge;
-            p.galley_with_override_text_color(lr.min, g, INK.gamma_multiply(a));
+            let base = if !synced { 0.82 } else if manual { 0.5 } else { 0.3 };
+            let a = ((base + (1.0 - base) * on) + if hot { 0.22 } else { 0.0 }).min(1.0) * edge;
+            let col = INK.gamma_multiply(a);
+            match big {
+                // repos : galley à sa taille native (net) ; transition : grande version mise à l'échelle
+                Some(b) if on > 0.995 => p.galley_with_override_text_color(lr.min, b, col),
+                Some(b) if on > 0.005 => {
+                    let mut ts = egui::epaint::TextShape::new(Pos2::ZERO, b, col).with_override_text_color(col);
+                    ts.transform(egui::emath::TSTransform::new(lr.min.to_vec2(), sc));
+                    p.add(ts);
+                }
+                _ => p.galley_with_override_text_color(lr.min, g, col),
+            }
             if hot {
                 let resp = ui.interact(lr, ui.scope_id().with(("lyl", i)), Sense::click());
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.acts.push(Act::Seek((lines[i].0 as f32 / len_ms).clamp(0.0, 1.0)));
-                    self.ly_manual = None;
+                    acts.push(Act::Seek((ly.starts[i] as f32 / len_ms).clamp(0.0, 1.0)));
+                    ly.manual = None;
                 }
+            }
+        }
+        // repaint : plein régime pendant un mouvement, sinon réveil pile à la ligne suivante
+        let ctx = ui.ctx();
+        if ly.moving(now) {
+            ctx.request_repaint();
+        } else if dots_live && playing {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else if synced && playing {
+            if let Some(nx) = ly.starts.iter().find(|t| **t > pos_ms && **t != u32::MAX) {
+                ctx.request_repaint_after(Duration::from_millis((nx - pos_ms) as u64 + 5));
             }
         }
     }
@@ -2124,6 +2339,57 @@ impl App {
             });
         });
 
+        set_head(ui, "Playback");
+        let (cur_q, flac) = (self.ws.quality, self.ws.flac);
+        let opts: [(&str, &str, &str); 4] = [("", "Account", "Uses your Deezer account setting"), ("standard", "Standard", "MP3 128 kbps"), ("high", "High", "MP3 320 kbps"), ("lossless", "HiFi", "FLAC 16-bit / 44.1 kHz · Deezer Premium")];
+        let sel = opts.iter().position(|o| o.0 == self.cfg.quality).unwrap_or(0);
+        let now = match cur_q {
+            "low" => "Low",
+            "standard" => "MP3 128",
+            "high" => "MP3 320",
+            "lossless" => "FLAC",
+            _ => "",
+        };
+        let mut sub = opts[sel].2.to_owned();
+        if !now.is_empty() {
+            sub += &format!(" · playing {now}");
+        }
+        if sel == 3 && !flac && !cur_q.is_empty() {
+            sub += " · HiFi not offered for this account";
+        }
+        let mut pick = None;
+        set_group(ui, |ui| {
+            set_row(ui, "Audio quality", &sub, false, |_| {});
+            // contrôle segmenté : piste sombre, segment actif blanc qui glisse
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+            let seg_w = r.width() / 4.0;
+            let p = ui.painter();
+            p.rect_filled(r, CornerRadius::same(10), Color32::from_white_alpha(7));
+            let x = ui.ctx().animate_value_with_time(ui.id().with("q_seg"), sel as f32, 0.2);
+            let ar = Rect::from_min_size(pos2(r.min.x + seg_w * x, r.min.y), vec2(seg_w, r.height())).shrink(3.0);
+            p.rect_filled(ar.translate(vec2(0.0, 1.0)), CornerRadius::same(8), Color32::from_black_alpha(60));
+            p.rect_filled(ar, CornerRadius::same(8), INK);
+            for (i, o) in opts.iter().enumerate() {
+                let sr = Rect::from_min_size(pos2(r.min.x + seg_w * i as f32, r.min.y), vec2(seg_w, r.height()));
+                let resp = ui.interact(sr, ui.id().with(("q", i)), Sense::click());
+                let on = (1.0 - (x - i as f32).abs()).clamp(0.0, 1.0);
+                let col = (if resp.hovered() { INK } else { SECOND }).lerp_to_gamma(BG, on);
+                let g = galley(p, o.1, med(12.5), col, seg_w - 8.0);
+                p.galley(sr.center() - g.size() / 2.0, g, col);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && i != sel {
+                    pick = Some(o.0);
+                }
+            }
+            ui.add_space(14.0);
+        });
+        if let Some(q) = pick {
+            self.cfg.quality = q.to_owned();
+            self.cfg.save();
+            if let Some(w) = &self.web {
+                w.set_quality(q);
+            }
+        }
+
         set_head(ui, "Updates");
         let st = self.upd.get();
         let sub = match &st {
@@ -2251,6 +2517,8 @@ impl App {
     }
 }
 
+static PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DEEZER_PROF").is_some());
+
 impl eframe::App for App {
     fn logic(&mut self, _ctx: &Context, _frame: &mut eframe::Frame) {
         self.tick();
@@ -2258,6 +2526,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let t_ui = Instant::now();
+        let prev_cpu = frame.info().cpu_usage.unwrap_or(0.0);
         let mut web_rect = None;
         if self.web_login {
             web_rect = Some(self.web_login_ui(ui));
@@ -2288,7 +2558,7 @@ impl eframe::App for App {
         if let Some((url, visible)) = self.web_want.take() {
             let r = web_rect.unwrap_or(Rect::from_min_size(pos2(0.0, 0.0), vec2(1.0, 1.0)));
             let arl = if url == crate::web::ENGINE_URL { self.cfg.arl.clone() } else { String::new() };
-            match crate::web::Web::new(frame, ctx.clone(), url, visible, r, &arl) {
+            match crate::web::Web::new(frame, ctx.clone(), url, visible, r, &arl, &self.cfg.quality) {
                 Ok(w) => self.web = Some(w),
                 Err(e) => {
                     self.web_login = false;
@@ -2309,6 +2579,13 @@ impl eframe::App for App {
         let acts = std::mem::take(&mut self.acts);
         for a in acts {
             self.apply(a);
+        }
+        if *PROF {
+            let ms = t_ui.elapsed().as_secs_f32() * 1000.0;
+            let dt = ctx.input(|i| i.unstable_dt) * 1000.0;
+            if ms > 4.0 || prev_cpu * 1000.0 > 8.0 || dt > 30.0 {
+                eprintln!("frame {} ui={ms:.1}ms prev_cpu={:.1}ms dt={dt:.0}ms np={} imgs_loaded={}", ctx.cumulative_pass_nr(), prev_cpu * 1000.0, self.now_playing, self.imgs.cache.len());
+            }
         }
     }
 

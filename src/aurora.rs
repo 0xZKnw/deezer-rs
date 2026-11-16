@@ -11,6 +11,10 @@ use eframe::egui_glow;
 use eframe::glow::{self, HasContext};
 use std::sync::Arc;
 
+/// pas de la grille du champ (pt) : 3×3 échantillons par glyphe de 5×8 pt
+const STEP: [f32; 2] = [5.0 / 3.0, 8.0 / 3.0];
+const STEP_GLSL: &str = "#define STEP vec2(1.6666667, 2.6666667)\n";
+
 const LW: usize = 370;
 const LH: usize = 310;
 
@@ -61,12 +65,13 @@ void main() {
 }
 "#;
 
-const FS: &str = r#"
+/// Passe 1 — sur une grille de 3×3 points par cellule ASCII (5×8 pt), en flottant 16 bits : champ lumineux (4 rideaux teintés + dérive)
+/// et émission. Résultat dans une petite texture (≈ 300×200 texels au lieu de millions de pixels).
+const FS_FIELD: &str = r#"
 uniform sampler2D u_lamp;
 uniform vec2 u_size;
+uniform vec2 u_grid;
 uniform float u_phase;
-uniform float u_ppp;
-uniform float u_opacity;
 uniform vec4 u_rect[4];
 uniform vec4 u_tint[4];
 uniform vec4 u_col[4];
@@ -106,6 +111,33 @@ vec2 lightUV(vec2 p, float t) {
     return clamp(p + drift * smoothstep(vec2(0.0), vec2(0.12), min(p, 1.0 - p)), 0.0, 1.0);
 }
 
+void main() {
+    vec2 cell = vec2(floor(gl_FragCoord.x), u_grid.y - 1.0 - floor(gl_FragCoord.y));
+    vec2 p = (cell + 0.5) * STEP / u_size;
+    float t = u_phase;
+    vec4 lamp = prints(lightUV(p, t));
+    if (lamp.a <= 0.003) { O_COLOR = vec4(0.0); return; }
+    float arc = p.y + 0.065*sin(5.0*p.x + 0.24*t) + 0.035*sin(10.0*p.x - 0.31*t);
+    float ribbon = 0.5 + 0.5*cos(10.5*arc - 0.82*t + 1.3*p.x);
+    float glint = 0.5 + 0.5*sin(18.0*arc + 3.3*p.x - 0.58*t);
+    float veil = 0.5 + 0.5*cos(4.7*p.x - 2.6*p.y + 0.37*t);
+    float light = 0.77 + 0.26*ribbon + 0.12*glint*glint + 0.05*veil;
+    vec3 emission = vec3(light + 0.08*ribbon*glint, light, light + 0.085*(1.0-ribbon)*veil);
+    O_COLOR = vec4(min(lamp.rgb * emission, vec3(lamp.a)), lamp.a);
+}
+"#;
+
+/// Passe 2 — par pixel : lit le champ (bilinéaire pour la couleur, centre de cellule pour le
+/// niveau) et dessine le glyphe. Deux lectures de texture + quelques distances.
+const FS: &str = r#"
+uniform sampler2D u_field;
+uniform vec2 u_size;
+uniform vec2 u_grid;
+uniform float u_phase;
+uniform float u_ppp;
+uniform float u_opacity;
+V_IN vec2 v_uv;
+
 float seg(vec2 p, vec2 a, vec2 b, float hw) {
     vec2 pa = p - a, ba = b - a;
     float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
@@ -125,47 +157,52 @@ float glyph(float k, vec2 p) {
 }
 
 void main() {
-    vec2 p = v_uv;
-    float t = u_phase;
-    vec4 lamp = prints(lightUV(p, t));
+    vec2 pt = v_uv * u_size;
+    vec4 lamp = TEX(u_field, vec2(pt.x / STEP.x / u_grid.x, 1.0 - pt.y / STEP.y / u_grid.y));
     if (lamp.a <= 0.003) { O_COLOR = vec4(0.0); return; }
-    vec2 cells = u_size / vec2(5.0, 8.0);
-    vec2 cell = floor(p * cells);
-    vec2 center = (cell + 0.5) / cells;
-    vec2 local = fract(p * cells);
-    float arc = p.y + 0.065*sin(5.0*p.x + 0.24*t) + 0.035*sin(10.0*p.x - 0.31*t);
-    float ribbon = 0.5 + 0.5*cos(10.5*arc - 0.82*t + 1.3*p.x);
-    float glint = 0.5 + 0.5*sin(18.0*arc + 3.3*p.x - 0.58*t);
-    float veil = 0.5 + 0.5*cos(4.7*p.x - 2.6*p.y + 0.37*t);
-    float light = 0.77 + 0.26*ribbon + 0.12*glint*glint + 0.05*veil;
-    vec3 emission = vec3(light + 0.08*ribbon*glint, light, light + 0.085*(1.0-ribbon)*veil);
-    float intensity = prints(lightUV(center, t)).a;
+    vec2 g = pt / vec2(5.0, 8.0);
+    vec2 cell = floor(g);
+    vec2 cpt = (cell + 0.5) * vec2(5.0, 8.0);
+    float intensity = TEX(u_field, vec2(cpt.x / STEP.x / u_grid.x, 1.0 - cpt.y / STEP.y / u_grid.y)).a;
+    vec2 center = (cell + 0.5) * vec2(5.0, 8.0) / u_size;
+    float t = u_phase;
     float wave = 0.5 + 0.5*cos(10.5*(center.y + 0.065*sin(5.0*center.x + 0.24*t)) - 0.82*t + 1.3*center.x);
     float level = 6.0 * clamp(intensity * (0.65 + 0.60*wave), 0.0, 1.0);
     float index = floor(level);
-    vec2 lp = local * vec2(5.0, 8.0);
+    vec2 lp = fract(g) * vec2(5.0, 8.0);
     float first = glyph(index, lp);
     float next = glyph(min(6.0, index + 1.0), lp);
     float mark = mix(first, next, smoothstep(0.32, 0.68, fract(level)));
     float alpha = lamp.a;
-    vec3 color = min(lamp.rgb * emission, vec3(alpha));
-    O_COLOR = vec4(mix(color, vec3(alpha), 0.45*mark*smoothstep(0.25, 1.65, level)), alpha) * u_opacity;
+    vec4 o = vec4(mix(lamp.rgb, vec3(alpha), 0.45*mark*smoothstep(0.25, 1.65, level)), alpha) * u_opacity;
+    // tramage léger : pas de paliers visibles dans les dégradés sombres (sortie 8 bits)
+    float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
+    o.rgb = max(o.rgb + n * (1.5 / 255.0) * o.a, 0.0);
+    O_COLOR = o;
 }
 "#;
 
 pub struct Aurora {
     prog: glow::Program,
+    field_prog: glow::Program,
     vao: Option<glow::VertexArray>,
     vbo: glow::Buffer,
     tex: glow::Texture,
-    loc: [Option<glow::UniformLocation>; 8],
+    fbo: glow::Framebuffer,
+    field: glow::Texture,
+    loc: [Option<glow::UniformLocation>; 6],
+    floc: [Option<glow::UniformLocation>; 7],
+    /// (grille, paramètres) de la dernière passe 1 : on ne la refait que si quelque chose change
+    last: std::sync::Mutex<Option<((i32, i32, f32, f32), Params)>>,
+    /// texture du champ en flottant 16 bits (sinon 8 bits)
+    half: std::sync::atomic::AtomicBool,
 }
 
 // Les handles GL sont de simples entiers ; on ne les utilise que depuis le thread de rendu.
 unsafe impl Send for Aurora {}
 unsafe impl Sync for Aurora {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Params {
     pub phase: f32,
     /// 0 = bandeau en haut de fenêtre, 1 = pleine hauteur (connexion, Now Playing) ; animable
@@ -203,30 +240,37 @@ impl Aurora {
             ("#define V_IN attribute\n#define V_OUT varying\n", "#define V_IN varying\n#define TEX texture2D\n#define O_COLOR gl_FragColor\n")
         };
         let prec = if matches!(sv, egui_glow::ShaderVersion::Es100 | egui_glow::ShaderVersion::Es300) { "precision highp float;\n" } else { "" };
-        unsafe {
-            let prog = gl.create_program().ok()?;
-            let mut shaders = vec![];
-            for (ty, src) in [(glow::VERTEX_SHADER, format!("{head}{prec}{vdefs}{VS}")), (glow::FRAGMENT_SHADER, format!("{head}{prec}{fdefs}{FS}"))] {
-                let s = gl.create_shader(ty).ok()?;
-                gl.shader_source(s, &src);
-                gl.compile_shader(s);
-                if !gl.get_shader_compile_status(s) {
-                    eprintln!("aurora shader: {}", gl.get_shader_info_log(s));
+        let compile = |fs: &str| -> Option<glow::Program> {
+            unsafe {
+                let prog = gl.create_program().ok()?;
+                let mut shaders = vec![];
+                for (ty, src) in [(glow::VERTEX_SHADER, format!("{head}{prec}{vdefs}{VS}")), (glow::FRAGMENT_SHADER, format!("{head}{prec}{fdefs}{STEP_GLSL}{fs}"))] {
+                    let s = gl.create_shader(ty).ok()?;
+                    gl.shader_source(s, &src);
+                    gl.compile_shader(s);
+                    if !gl.get_shader_compile_status(s) {
+                        eprintln!("aurora shader: {}", gl.get_shader_info_log(s));
+                        return None;
+                    }
+                    gl.attach_shader(prog, s);
+                    shaders.push(s);
+                }
+                gl.bind_attrib_location(prog, 0, "a_pos");
+                gl.link_program(prog);
+                if !gl.get_program_link_status(prog) {
+                    eprintln!("aurora link: {}", gl.get_program_info_log(prog));
                     return None;
                 }
-                gl.attach_shader(prog, s);
-                shaders.push(s);
+                for s in shaders {
+                    gl.detach_shader(prog, s);
+                    gl.delete_shader(s);
+                }
+                Some(prog)
             }
-            gl.bind_attrib_location(prog, 0, "a_pos");
-            gl.link_program(prog);
-            if !gl.get_program_link_status(prog) {
-                eprintln!("aurora link: {}", gl.get_program_info_log(prog));
-                return None;
-            }
-            for s in shaders {
-                gl.detach_shader(prog, s);
-                gl.delete_shader(s);
-            }
+        };
+        let prog = compile(FS)?;
+        let field_prog = compile(FS_FIELD)?;
+        unsafe {
             let vao = if new { gl.create_vertex_array().ok() } else { None };
             if let Some(v) = vao {
                 gl.bind_vertex_array(Some(v));
@@ -267,9 +311,22 @@ impl Aurora {
                 glow::PixelUnpackData::Slice(Some(&px)),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let names = ["u_lamp", "u_size", "u_phase", "u_ppp", "u_opacity", "u_rect", "u_tint", "u_col"];
-            let loc = names.map(|n| if n.is_empty() { None } else { gl.get_uniform_location(prog, n) });
-            Some(Self { prog, vao, vbo, tex, loc })
+            // texture du champ (taille ajustée à chaque passe) + framebuffer
+            let field = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(field));
+            for (k, v) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            let fbo = gl.create_framebuffer().ok()?;
+            let loc = ["u_field", "u_size", "u_grid", "u_phase", "u_ppp", "u_opacity"].map(|n| gl.get_uniform_location(prog, n));
+            let floc = ["u_lamp", "u_size", "u_grid", "u_phase", "u_rect", "u_tint", "u_col"].map(|n| gl.get_uniform_location(field_prog, n));
+            Some(Self { prog, field_prog, vao, vbo, tex, fbo, field, loc, floc, last: std::sync::Mutex::new(None), half: std::sync::atomic::AtomicBool::new(true) })
         }
     }
 
@@ -292,30 +349,78 @@ impl Aurora {
             tints[i * 4..i * 4 + 4].copy_from_slice(&[r.cos(), r.sin(), strength, prm.follow]);
             cols[i * 4..i * 4 + 3].copy_from_slice(&prm.cols[i]);
         }
+        // grille de cellules limitée à la zone visible (clip) : rien n'est calculé en dessous
+        let vis = (info.clip_rect.max.y - info.viewport.min.y).clamp(8.0, h);
+        let grid = ((w / STEP[0]).ceil() as i32, (vis / STEP[1]).ceil() as i32);
+        let gx = grid.0 as f32;
+        let vp = info.viewport_in_pixels();
+        let key = ((grid.0, grid.1, w, h), prm);
         unsafe {
+            let draw = |gl: &glow::Context| {
+                match self.vao {
+                    Some(v) => gl.bind_vertex_array(Some(v)),
+                    None => {
+                        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                        gl.enable_vertex_attrib_array(0);
+                        gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
+                    }
+                }
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                if self.vao.is_some() {
+                    gl.bind_vertex_array(None);
+                }
+            };
+            // passe 1 : champ par cellule (seulement si la phase, la teinte ou la taille ont changé)
+            let mut last = self.last.lock().unwrap();
+            if last.as_ref() != Some(&key) {
+                let prev_fb = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.field));
+                let realloc = last.as_ref().map(|l| (l.0 .0, l.0 .1)) != Some(grid);
+                let half = self.half.load(std::sync::atomic::Ordering::Relaxed);
+                if realloc {
+                    let (fmt, ty) = if half { (glow::RGBA16F, glow::HALF_FLOAT) } else { (glow::RGBA8, glow::UNSIGNED_BYTE) };
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, fmt as i32, grid.0, grid.1, 0, glow::RGBA, ty, glow::PixelUnpackData::Slice(None));
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.field), 0);
+                if realloc && half && gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                    // pas de rendu en flottant 16 bits : repli 8 bits
+                    self.half.store(false, std::sync::atomic::Ordering::Relaxed);
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, grid.0, grid.1, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.field), 0);
+                }
+                gl.disable(glow::SCISSOR_TEST);
+                gl.disable(glow::BLEND);
+                gl.viewport(0, 0, grid.0, grid.1);
+                gl.use_program(Some(self.field_prog));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.tex));
+                gl.uniform_1_i32(self.floc[0].as_ref(), 0);
+                gl.uniform_2_f32(self.floc[1].as_ref(), w, h);
+                gl.uniform_2_f32(self.floc[2].as_ref(), gx, grid.1 as f32);
+                gl.uniform_1_f32(self.floc[3].as_ref(), prm.phase);
+                gl.uniform_4_f32_slice(self.floc[4].as_ref(), &rects);
+                gl.uniform_4_f32_slice(self.floc[5].as_ref(), &tints);
+                gl.uniform_4_f32_slice(self.floc[6].as_ref(), &cols);
+                draw(gl);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, prev_fb);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.enable(glow::BLEND);
+                gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
+                *last = Some(key);
+            }
+            drop(last);
+            // passe 2 : glyphes, par pixel
             gl.use_program(Some(self.prog));
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.tex));
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.field));
             gl.uniform_1_i32(self.loc[0].as_ref(), 0);
             gl.uniform_2_f32(self.loc[1].as_ref(), w, h);
-            gl.uniform_1_f32(self.loc[2].as_ref(), prm.phase);
-            gl.uniform_1_f32(self.loc[3].as_ref(), info.pixels_per_point);
-            gl.uniform_1_f32(self.loc[4].as_ref(), prm.opacity);
-            gl.uniform_4_f32_slice(self.loc[5].as_ref(), &rects);
-            gl.uniform_4_f32_slice(self.loc[6].as_ref(), &tints);
-            gl.uniform_4_f32_slice(self.loc[7].as_ref(), &cols);
-            match self.vao {
-                Some(v) => gl.bind_vertex_array(Some(v)),
-                None => {
-                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-                    gl.enable_vertex_attrib_array(0);
-                    gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
-                }
-            }
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            if self.vao.is_some() {
-                gl.bind_vertex_array(None);
-            }
+            gl.uniform_2_f32(self.loc[2].as_ref(), gx, grid.1 as f32);
+            gl.uniform_1_f32(self.loc[3].as_ref(), prm.phase);
+            gl.uniform_1_f32(self.loc[4].as_ref(), info.pixels_per_point);
+            gl.uniform_1_f32(self.loc[5].as_ref(), prm.opacity);
+            draw(gl);
         }
     }
 

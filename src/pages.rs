@@ -316,6 +316,7 @@ impl<'a> Loader<'a> {
         let mut p = PageData {
             header: Some(Header { title: format!("Results for “{q}”"), ..Default::default() }),
             tracks_title: "Tracks".into(),
+            preview: 5,
             ..Default::default()
         };
         if let Some(v) = get(0) {
@@ -360,6 +361,7 @@ impl<'a> Loader<'a> {
                 ..Default::default()
             }),
             tracks_title: "Popular tracks".into(),
+            preview: 5,
             ..Default::default()
         };
         if let Some(v) = get(0) {
@@ -367,9 +369,19 @@ impl<'a> Loader<'a> {
             p.total = p.tracks.len() as u32;
         }
         if let Some(v) = get(1) {
-            let mut albums = cards(Kind::Album, v);
-            albums.sort_by(|a, b| b.extra_sort().cmp(&a.extra_sort()));
-            p.sections.extend(sec("Discography", albums, Style::Carousel));
+            // discographie découpée comme Deezer : albums, singles & EP, compilations (récent d'abord)
+            let pick = |types: &[&str]| {
+                let mut out: Vec<Card> = data(v)
+                    .iter()
+                    .filter(|x| types.contains(&x["record_type"].as_str().unwrap_or("album")))
+                    .filter_map(|x| Card::from_json(Kind::Album, x))
+                    .collect();
+                out.sort_by(|a, b| b.extra_sort().cmp(&a.extra_sort()));
+                out
+            };
+            p.sections.extend(sec("Albums", pick(&["album"]), Style::Carousel));
+            p.sections.extend(sec("Singles & EPs", pick(&["single", "ep"]), Style::Carousel));
+            p.sections.extend(sec("Compilations", pick(&["compile", "compilation"]), Style::Carousel));
         }
         if let Some(v) = get(3) {
             p.sections.extend(sec("Playlists featuring", cards(Kind::Playlist, v), Style::Carousel));

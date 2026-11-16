@@ -796,7 +796,9 @@ fn section_ui(ui: &mut Ui, cx: &mut Cx, offs: &mut HashMap<String, CarState>, s:
                 });
             });
             st.off = out.state.offset().x;
-            st.rect = Some(out.inner_rect);
+            // inner_rect s'étend jusqu'en bas de la page : on ne garde que la hauteur réelle du
+            // carrousel, sinon le premier capte le défilement destiné à ceux du dessous
+            st.rect = Some(Rect::from_min_size(out.inner_rect.min, vec2(out.inner_rect.width(), out.content_size.y.min(out.inner_rect.height()))));
             st.max = out.content_size.x - out.inner_rect.width();
         }
         Style::Tiles => {

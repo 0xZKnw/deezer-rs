@@ -27,7 +27,9 @@ fn main() -> eframe::Result {
         .with_min_inner_size([960.0, 600.0])
         .with_fullsize_content_view(true)
         .with_title_shown(false)
-        .with_titlebar_shown(false);
+        .with_titlebar_shown(false)
+        // icône vide : eframe n'impose pas son logo egui au Dock, macOS prend celle du bundle
+        .with_icon(egui::IconData::default());
     let options = eframe::NativeOptions {
         viewport,
         multisampling: 0,

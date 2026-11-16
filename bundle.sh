@@ -31,7 +31,6 @@ cat > "$APP/Contents/Info.plist" <<PL
 <key>CFBundleExecutable</key><string>Deezer</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>CFBundleIconName</key><string>AppIcon</string>
 <key>CFBundleVersion</key><string>$VERSION</string>
 <key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>NSHighResolutionCapable</key><true/>

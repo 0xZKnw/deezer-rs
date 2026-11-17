@@ -232,6 +232,10 @@ pub struct App {
     pub lyrics: Option<(u64, crate::lyrics::Lyrics)>,
     /// défilement manuel des paroles (décalage, instant) : suspend le suivi auto quelques secondes
     pub ly: crate::ui::LyAnim,
+    /// dernier saut manuel (évite de le prendre pour une relance du morceau)
+    pub seek_at: Option<Instant>,
+    /// historique local « Recently played » (connexion sans token OAuth)
+    pub recent: Vec<Card>,
 }
 
 #[derive(Clone, Copy)]
@@ -341,6 +345,8 @@ impl App {
             show_lyrics: false,
             lyrics: None,
             ly: Default::default(),
+            seek_at: None,
+            recent: crate::recent::load(),
         };
         if app.cfg.web {
             // session Deezer mémorisée par WebKit : on relance le lecteur officiel en arrière-plan
@@ -445,6 +451,59 @@ impl App {
         matches!(self.route, Route::FavTracks | Route::Playlists | Route::Albums | Route::Artists | Route::Podcasts)
     }
 
+    // ---------------------------------------------------------------- récemment écoutés
+
+    /// Ajoute/rafraîchit la section « Recently played » en tête de l'accueil (sans token :
+    /// avec token, l'accueil utilise déjà `/user/me/history`).
+    fn inject_recent(&mut self) {
+        if !self.cfg.token.is_empty() || self.recent.is_empty() {
+            return;
+        }
+        let secs = &mut self.page.data.sections;
+        match secs.first_mut() {
+            Some(s) if s.title == "Recently played" => s.cards = self.recent.clone(),
+            _ => secs.insert(0, Section { title: "Recently played".into(), cards: self.recent.clone(), style: Style::Carousel }),
+        }
+    }
+
+    fn note_recent(&mut self, c: Card) {
+        if crate::recent::push(&mut self.recent, c) && self.route == Route::Home && !self.page.loading {
+            self.inject_recent();
+        }
+    }
+
+    /// Contexte lancé depuis une page (album / playlist / artiste…) ; sinon l'album du morceau.
+    fn note_context(&mut self, t: Option<&Track>) {
+        let kind = match self.route {
+            Route::Album(_) => Some(Kind::Album),
+            Route::Playlist(_) => Some(Kind::Playlist),
+            Route::Artist(_) => Some(Kind::Artist),
+            Route::Podcast(_) => Some(Kind::Podcast),
+            Route::Radio(_) => Some(Kind::Radio),
+            _ => None,
+        };
+        let c = match (kind, &self.page.data.header) {
+            (Some(kind), Some(h)) if h.id != 0 => Card { kind, id: h.id, title: h.title.clone(), sub: h.line.clone(), extra: String::new(), img: h.img.clone(), explicit: false, owner: h.owner_id, track: None },
+            _ => match t {
+                Some(t) if t.album_id != 0 && !t.album.is_empty() => Card { kind: Kind::Album, id: t.album_id, title: t.album.clone(), sub: t.artist.clone(), extra: String::new(), img: t.img.clone(), explicit: false, owner: 0, track: None },
+                _ => return,
+            },
+        };
+        self.note_recent(c);
+    }
+
+    fn find_card(&self, k: Kind, id: u64) -> Option<Card> {
+        let l = &self.lib;
+        self.page.data.sections.iter().flat_map(|s| s.cards.iter())
+            .chain(l.albums.iter()).chain(l.playlists.iter()).chain(l.artists.iter()).chain(l.podcasts.iter()).chain(self.recent.iter())
+            .find(|c| c.kind == k && c.id == id)
+            .cloned()
+            .or_else(|| {
+                let h = self.page.data.header.as_ref()?;
+                (h.id == id && h.kind == Some(k)).then(|| Card { kind: k, id, title: h.title.clone(), sub: h.line.clone(), extra: String::new(), img: h.img.clone(), explicit: false, owner: h.owner_id, track: None })
+            })
+    }
+
     // ---------------------------------------------------------------- lecteur
 
     pub fn play_list(&mut self, tracks: Vec<Track>, start: usize, shuffle: bool) {
@@ -511,7 +570,9 @@ impl App {
             }
             if let Some(w) = &self.web {
                 w.control("setVolume", &format!("{}", self.volume));
-                w.play(t.id);
+                // la suite de notre file, pour que l'enchaînement naturel de Deezer soit le bon
+                let ids: Vec<u64> = if self.repeat == Repeat::One { vec![t.id] } else { self.queue[idx..].iter().take(50).map(|t| t.id).collect() };
+                w.play(&ids);
             }
             self.ctx.request_repaint();
             return;
@@ -710,6 +771,9 @@ impl App {
                             let default_sort = d.header.as_ref().map(|h| h.kind == Some(Kind::Playlist)).unwrap_or(false);
                             let _ = default_sort;
                             self.page.data = d;
+                            if self.route == Route::Home {
+                                self.inject_recent();
+                            }
                             self.page_t0 = Instant::now();
                             self.page.loading = false;
                             self.page.dirty = true;
@@ -823,10 +887,16 @@ impl App {
                     self.go(r, false);
                 }
             }
-            Act::PlayList { tracks, start, shuffle } => self.play_list(tracks, start, shuffle),
+            Act::PlayList { tracks, start, shuffle } => {
+                self.note_context(tracks.get(start).or(tracks.first()));
+                self.play_list(tracks, start, shuffle)
+            }
             Act::PlayContent(k, id, sh) => {
                 if k == Kind::Track {
                     return;
+                }
+                if let Some(c) = self.find_card(k, id) {
+                    self.note_recent(c);
                 }
                 self.toast("Loading…");
                 self.pool.job(Job::PlayContent { kind: k, id, shuffle: sh });
@@ -912,6 +982,7 @@ impl App {
             Act::Next => self.next(true),
             Act::Prev => self.prev(),
             Act::Seek(f) => {
+                self.seek_at = Some(Instant::now());
                 if self.use_web() {
                     let f = f.clamp(0.0, 1.0);
                     if let Some(w) = &self.web {
@@ -1138,7 +1209,7 @@ impl App {
     fn pump_web(&mut self) {
         use crate::web::WebMsg;
         loop {
-            let Some(m) = self.web.as_ref().and_then(|w| w.try_recv()) else { break };
+            let Some(m) = self.web.as_mut().and_then(|w| w.try_recv()) else { break };
             match m {
                 WebMsg::User { id, name, offer, .. } => {
                     if std::env::var_os("DRS_DEBUG").is_some() {
@@ -1202,9 +1273,28 @@ impl App {
                         if self.web_started && !playing && !loading && dur > 0.0 && (pos >= dur - 1.0 || near_end && pos < 1.0) {
                             ended = true;
                         }
+                        // le lecteur Deezer a relancé le même titre tout seul (répétition côté compte) :
+                        // c'est une fin de morceau, on passe au suivant de notre file
+                        if self.web_started && near_end && pos < 2.0 && dur > 0.0 && self.seek_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                            ended = true;
+                        }
                     } else if self.web_started && song != 0 {
-                        // le lecteur Deezer est passé à autre chose (fin de notre morceau)
-                        ended = true;
+                        // le lecteur Deezer a enchaîné : si c'est le suivant de notre file, on suit
+                        // sans relancer ; sinon on lance nous-mêmes le bon titre
+                        let ni = self.next_index(false).filter(|&i| self.queue.get(i).is_some_and(|t| t.id == song));
+                        match ni {
+                            Some(i) if i != self.qi => {
+                                self.qi = i;
+                                self.cur = Some(self.queue[i].clone());
+                                self.web_song = song;
+                                self.web_prev = cur;
+                                self.loading = !playing;
+                                self.web_started = playing;
+                                self.ctx.request_repaint();
+                                continue;
+                            }
+                            _ => ended = true,
+                        }
                     }
                     if ended {
                         self.web_started = false;

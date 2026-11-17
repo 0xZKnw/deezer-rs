@@ -13,6 +13,7 @@ mod icons;
 mod lyrics;
 mod model;
 mod pages;
+mod recent;
 mod ui;
 mod update;
 mod web;

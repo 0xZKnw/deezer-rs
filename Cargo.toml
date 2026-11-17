@@ -19,6 +19,11 @@ lru = "0.19"
 open = "5"
 # WebView système (WKWebView) : connexion Deezer officielle + lecteur du site (morceaux complets)
 wry = { version = "0.55", default-features = false }
+# accès direct à WebKit (liste de blocage du lecteur caché) ; mêmes versions que wry
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "WKContentRuleList", "WKContentRuleListStore", "WKUserContentController"] }
+block2 = "0.6"
 memmap2 = "0.9"
 
 [profile.release]

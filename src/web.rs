@@ -18,6 +18,8 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/60
 const INIT_JS: &str = r#"(()=>{if(window.__drs)return;window.__drs=1;
 const send=o=>{try{window.ipc.postMessage(JSON.stringify(o))}catch(e){}};
 const onDz=location.hostname==='www.deezer.com';
+// la page Deezer n'est jamais affichée (seule la page de connexion l'est) : pas de mise en page ni de rendu
+if(onDz){const st=document.createElement('style');st.textContent='html{display:none!important}';(document.head||document.documentElement).appendChild(st)}
 let tok='';
 const GW='/ajax/gw-light.php?input=3&api_version=1.0&method=';
 async function who(){
@@ -43,15 +45,20 @@ window.__drs_gw=async(id,method,params)=>{
   if(bad(j.error)){await who();j=await call()}
   send({t:'gw',id,err:bad(j.error)?JSON.stringify(j.error):''});
  }catch(e){send({t:'gw',id,err:String(e)})}};
-const setQ=p=>{const q=window.__drs_q;if(q)try{if(p.control.getAudioQuality()!==q)p.control.setAudioQuality(q)}catch(e){}};
+const noRep=p=>{try{const r=p.getRepeat?p.getRepeat():0;if(r)p.control.setRepeat(0)}catch(e){}};
+const setQ=p=>{noRep(p);const q=window.__drs_q;if(q)try{if(p.control.getAudioQuality()!==q)p.control.setAudioQuality(q)}catch(e){}};
 window.__drs_setq=q=>{window.__drs_q=q;const p=window.dzPlayer;if(p&&p.control)setQ(p)};
 window.__drs_play=(id,n)=>{const p=window.dzPlayer;n=n||0;
  if(!p||!p.play){if(n<60)setTimeout(()=>window.__drs_play(id,n+1),250);else send({t:'noplayer'});return}
  setQ(p);
- const s=String(id);p.play({type:'track',id:[s],index:0,context:{ID:s,TYPE:'track_page',CONTEXT_ID:s}});};
+ const a=(Array.isArray(id)?id:[id]).map(String);p.play({type:'track',id:a,index:0,context:{ID:a[0],TYPE:'track_page',CONTEXT_ID:a[0]}});};
 window.__drs_c=(f,a)=>{try{const c=window.dzPlayer.control;c[f].apply(c,a||[])}catch(e){}};
 let last='';
 setInterval(()=>{const p=window.dzPlayer;if(!p||!p.getSongId)return;let s;
+ if(window.__drs_auto&&p.play){const a=window.__drs_auto;window.__drs_auto=0;window.__drs_autot=a.length>1?2:1;window.__drs_play(a)}
+ if(window.__drs_autot===1&&p.getPosition()>3){window.__drs_autot=0;try{p.control.pause()}catch(e){}}
+ if(window.__drs_autot===2&&p.getPosition()>3&&p.getDuration()>10){window.__drs_autot=3;window.__drs_s0=p.getSongId();try{p.control.seek((p.getDuration()-4)/p.getDuration())}catch(e){}}
+ if(window.__drs_autot===3&&p.getSongId()!=window.__drs_s0&&p.getPosition()>3){window.__drs_autot=0;try{p.control.pause()}catch(e){}}
  if(!window.__drs_dbg){window.__drs_dbg=1;try{const f=o=>{const r=[];for(const k in o){try{r.push(k+':'+typeof o[k])}catch(e){}}return r};send({t:'dbg',v:JSON.stringify({p:f(p),c:f(p.control||{}),s:[...document.scripts].map(x=>x.src).filter(Boolean)})})}catch(e){}}
 
  try{s={t:'st',song:Number(p.getSongId())||0,playing:!!p.isPlaying(),pos:p.getPosition()||0,dur:p.getDuration()||0,load:!!p.isLoading()};setQ(p);s.q=String(p.control.getAudioQuality()||'');s.flac=!!(p.html5&&p.html5.flac)}catch(e){return}
@@ -77,6 +84,78 @@ pub struct Web {
     rx: Receiver<WebMsg>,
     pub visible: bool,
     bounds: egui::Rect,
+    /// page à charger dès que la liste de blocage est prête (lecteur caché)
+    pending: Option<(String, std::time::Instant)>,
+    rules_on: bool,
+}
+
+/// Lecteur caché allégé : WebKit ne télécharge ni images, ni polices, ni traceurs tiers
+/// (rien n'est affiché, seul le moteur audio compte). Désactivé quand la WebView est visible
+/// (page de connexion), pour qu'elle reste normale.
+mod light {
+    use objc2::{rc::Retained, MainThreadMarker};
+    use objc2_foundation::{NSError, NSString};
+    use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKUserContentController};
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// traceurs / mesure d'audience tiers (aucun domaine Deezer)
+    const TRACKERS: [&str; 26] = [
+        "google-analytics", "googletagmanager", "googleadservices", "doubleclick", "facebook", "fbcdn", "braze", "appboy", "sentry",
+        "hotjar", "scorecardresearch", "criteo", "adsrvr", "amazon-adsystem", "tiktok", "snapchat", "pinterest", "clarity",
+        "onetrust", "cookielaw", "appsflyer", "branch", "segment", "mixpanel", "amplitude", "nr-data",
+    ];
+
+    /// règles WebKit (pas d'alternative « | » dans les filtres : une règle par domaine)
+    fn rules() -> String {
+        let mut r = vec![r#"{"trigger":{"url-filter":".*","resource-type":["image","font","svg-document"]},"action":{"type":"block"}}"#.to_owned()];
+        for d in TRACKERS {
+            r.push(format!(r#"{{"trigger":{{"url-filter":"^https?://([^/]*\\.)?{d}\\.","load-type":["third-party"]}},"action":{{"type":"block"}}}}"#));
+        }
+        format!("[{}]", r.join(","))
+    }
+
+    thread_local!(static LIST: RefCell<Option<Retained<WKContentRuleList>>> = const { RefCell::new(None) });
+    pub static READY: AtomicBool = AtomicBool::new(false);
+
+    pub fn compile(ctx: eframe::egui::Context) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            READY.store(true, Ordering::Relaxed);
+            return;
+        };
+        unsafe {
+            let Some(store) = WKContentRuleListStore::defaultStore(mtm) else {
+                READY.store(true, Ordering::Relaxed);
+                return;
+            };
+            let blk = block2::RcBlock::new(move |list: *mut WKContentRuleList, err: *mut NSError| {
+                if let (Some(e), true) = (Retained::retain(err), std::env::var_os("DEEZER_PROF").is_some()) {
+                    eprintln!("content rules: {}", e.localizedDescription());
+                }
+                if let Some(l) = Retained::retain(list) {
+                    LIST.with(|c| *c.borrow_mut() = Some(l));
+                }
+                READY.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+            });
+            store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+                Some(&NSString::from_str("drs-light-2")),
+                Some(&NSString::from_str(&rules())),
+                Some(&blk),
+            );
+        }
+    }
+
+    /// true si la liste a bien été appliquée
+    pub fn apply(ctrl: &WKUserContentController, on: bool) -> bool {
+        unsafe {
+            ctrl.removeAllContentRuleLists();
+            if on {
+                return LIST.with(|c| c.borrow().as_ref().map(|l| ctrl.addContentRuleList(l)).is_some());
+            }
+        }
+        true
+    }
 }
 
 fn parse(s: &str) -> Option<WebMsg> {
@@ -84,6 +163,7 @@ fn parse(s: &str) -> Option<WebMsg> {
     let st = |k: &str| v[k].as_str().unwrap_or("").to_owned();
     Some(match v["t"].as_str()? {
         "user" => WebMsg::User { id: v["id"].as_u64().unwrap_or(0), name: st("name"), pic: st("pic"), offer: st("offer") },
+        "st" if std::env::var_os("DEEZER_PROF").is_some() && { eprintln!("web st: {s}"); false } => return None,
         "st" => WebMsg::State {
             song: v["song"].as_u64().unwrap_or(0),
             playing: v["playing"].as_bool().unwrap_or(false),
@@ -121,9 +201,16 @@ impl Web {
         // session sauvegardée : le script de page la remet en cookie si WebKit l'a perdue
         let arl: String = arl.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         let q = if crate::config::QUALITIES.contains(&quality) { quality } else { "" };
-        let init = format!("window.__drs_arl={};window.__drs_q={:?};{INIT_JS}", serde_json::to_string(&arl).unwrap_or_default(), q);
+        // test automatique (profilage seulement) : DEEZER_AUTOPLAY=<id> joue 3 s puis met en pause
+        // DEEZER_AUTOPLAY=<id>,<id> : enchaîne vers le 2e titre (test de la suite de file)
+        let auto: Vec<u64> = std::env::var("DEEZER_AUTOPLAY").ok().filter(|_| std::env::var_os("DEEZER_PROF").is_some()).map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+        let auto = if auto.is_empty() { "0".to_owned() } else { format!("{auto:?}") };
+        let init = format!("window.__drs_arl={};window.__drs_q={:?};window.__drs_auto={auto};{INIT_JS}", serde_json::to_string(&arl).unwrap_or_default(), q);
+        light::compile(ctx.clone());
+        // lecteur caché : on attend la liste de blocage (quelques ms) avant de charger le site
+        let pending = (!visible).then(|| (url.to_owned(), std::time::Instant::now()));
         let view = WebViewBuilder::new()
-            .with_url(url)
+            .with_url(if visible { url } else { "about:blank" })
             .with_user_agent(UA)
             .with_initialization_script(&init)
             .with_autoplay(true)
@@ -139,11 +226,29 @@ impl Web {
             })
             .build_as_child(frame)
             .map_err(|e| e.to_string())?;
-        Ok(Self { view, rx, visible, bounds })
+        Ok(Self { view, rx, visible, bounds, pending, rules_on: false })
     }
 
-    pub fn try_recv(&self) -> Option<WebMsg> {
+    pub fn try_recv(&mut self) -> Option<WebMsg> {
+        self.sync_rules();
         self.rx.try_recv().ok()
+    }
+
+    fn sync_rules(&mut self) {
+        use std::sync::atomic::Ordering;
+        let ready = light::READY.load(Ordering::Relaxed);
+        let want = !self.visible && ready;
+        if want != self.rules_on {
+            use wry::WebViewExtMacOS;
+            self.rules_on = light::apply(&self.view.manager(), want) && want;
+        }
+        if let Some((url, t0)) = &self.pending {
+            if ready || t0.elapsed() > std::time::Duration::from_secs(2) {
+                let url = url.clone();
+                self.pending = None;
+                self.load(&url);
+            }
+        }
     }
 
     pub fn show(&mut self, on: bool) {
@@ -173,8 +278,10 @@ impl Web {
         let _ = self.view.evaluate_script(s);
     }
 
-    pub fn play(&self, track: u64) {
-        self.js(&format!("window.__drs_play&&window.__drs_play({track})"));
+    /// Lance `ids[0]` ; les suivants forment la suite du lecteur Deezer (sinon il enchaîne
+    /// sur ses propres recommandations à la fin du morceau).
+    pub fn play(&self, ids: &[u64]) {
+        self.js(&format!("window.__drs_play&&window.__drs_play({ids:?})"));
     }
 
     /// Qualité audio du lecteur officiel (s'applique au prochain chargement de morceau).

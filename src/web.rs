@@ -61,7 +61,7 @@ setInterval(()=>{const p=window.dzPlayer;if(!p||!p.getSongId)return;let s;
  if(window.__drs_autot===3&&p.getSongId()!=window.__drs_s0&&p.getPosition()>3){window.__drs_autot=0;try{p.control.pause()}catch(e){}}
  if(!window.__drs_dbg){window.__drs_dbg=1;try{const f=o=>{const r=[];for(const k in o){try{r.push(k+':'+typeof o[k])}catch(e){}}return r};send({t:'dbg',v:JSON.stringify({p:f(p),c:f(p.control||{}),s:[...document.scripts].map(x=>x.src).filter(Boolean)})})}catch(e){}}
 
- try{s={t:'st',song:Number(p.getSongId())||0,playing:!!p.isPlaying(),pos:p.getPosition()||0,dur:p.getDuration()||0,load:!!p.isLoading()};setQ(p);s.q=String(p.control.getAudioQuality()||'');s.flac=!!(p.html5&&p.html5.flac)}catch(e){return}
+ try{s={t:'st',song:Number(p.getSongId())||0,playing:!!p.isPlaying(),pos:Number(p.getPosition())||0,dur:Number(p.getDuration())||0,load:!!p.isLoading()};setQ(p);s.q=String(p.control.getAudioQuality()||'');s.flac=!!(p.html5&&p.html5.flac)}catch(e){return}
  const k=[s.song,s.playing,s.load,Math.round(s.dur),s.q].join();
  if(k!==last||s.playing){last=k;send(s)}},500);
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',who);else who();
@@ -167,8 +167,9 @@ fn parse(s: &str) -> Option<WebMsg> {
         "st" => WebMsg::State {
             song: v["song"].as_u64().unwrap_or(0),
             playing: v["playing"].as_bool().unwrap_or(false),
-            pos: v["pos"].as_f64().unwrap_or(0.0) as f32,
-            dur: v["dur"].as_f64().unwrap_or(0.0) as f32,
+            // Deezer donne parfois la durée en texte ("137") après un enchaînement automatique
+            pos: num(&v["pos"]),
+            dur: num(&v["dur"]),
             loading: v["load"].as_bool().unwrap_or(false),
             quality: st("q"),
             flac: v["flac"].as_bool().unwrap_or(false),
@@ -304,4 +305,8 @@ impl Web {
     pub fn clear(&self) {
         let _ = self.view.clear_all_browsing_data();
     }
+}
+
+fn num(v: &Value) -> f32 {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|x: &f64| x.is_finite()).unwrap_or(0.0) as f32
 }

@@ -1144,6 +1144,12 @@ fn header_ui(ui: &mut Ui, cx: &mut Cx, ps: &mut PageState, route: &Route) {
                     if pill(ui, "Mix", false).clicked() {
                         cx.acts.push(Act::ArtistRadio(h.id));
                     }
+                    // titres de cet artiste dans les favoris, joués comme une playlist
+                    let n = cx.lib.tracks.iter().filter(|t| t.artist_id == h.id).count();
+                    if n > 0 && pill(ui, &format!("Your liked tracks · {n}"), false).on_hover_text("Play the tracks you liked from this artist").clicked() {
+                        let tracks: Vec<Track> = cx.lib.tracks.iter().filter(|t| t.artist_id == h.id).cloned().collect();
+                        cx.acts.push(Act::PlayList { tracks, start: 0, shuffle: cx.shuffle });
+                    }
                 }
                 Some(Kind::Album) => {
                     let on = cx.lib.album_ids.contains(&h.id);
